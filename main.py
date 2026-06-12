@@ -81,7 +81,7 @@ async def upload_file(
             f.write(contents)
 
         # 5. Embed and index into Qdrant
-        main_pipeline(temp_file_path, user_id=user_id)
+        main_pipeline(temp_file_path, user_id=user_id, qdrant_client=ai_models["qdrant_client"])    
 
         return {
             "message":  f"File '{file.filename}' processed and indexed successfully!",

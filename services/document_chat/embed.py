@@ -252,12 +252,13 @@ def load_file(file_path):
         return []
 
 
-def main_pipeline(file_paths, user_id: str = None):
+def main_pipeline(file_path: str, user_id: str, qdrant_client=None, embedding_model=None):
     """
     user_id is now stored in each Qdrant point's payload so queries can be
     filtered by owner (preventing cross-user data leakage).
     """
-    client = setup_qdrant()
+    from .processor import setup_qdrant as _setup,load_model as _load
+    client = qdrant_client if qdrant_client is not None else _setup()
     create_collection(client)
 
     if isinstance(file_paths, str):
@@ -279,7 +280,7 @@ def main_pipeline(file_paths, user_id: str = None):
         for chunk in chunks:
             chunk["user_id"] = user_id
 
-    model   = load_model()
+    model = embedding_model if embedding_model is not None else _load()
     vectors = embed_chunks(chunks, model)
     insert_to_qdrant(chunks, vectors, client)
     verify_insert(client)

@@ -3,3 +3,6 @@ __pycache__/
 .env
 .DS_Store
 temp_*/
+temp_*.pdf
+temp_*.docx
+temp_*.xlsx
