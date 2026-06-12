@@ -12,7 +12,13 @@ from supabase import create_client, Client
 load_dotenv()
 
 SUPABASE_URL: str = os.environ["SUPABASE_URL"]
-SUPABASE_KEY: str = os.environ["SUPABASE_ANON_KEY"]
+
+# Backend always uses the service role key so it can bypass RLS.
+# NEVER expose this key in the frontend — it's only safe server-side.
+SUPABASE_KEY: str = (
+    os.environ.get("SUPABASE_SERVICE_KEY")
+    or os.environ.get("SUPABASE_ANON_KEY")  # fallback so local dev still works
+)
 
 _supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -79,7 +85,6 @@ def get_tenant_documents(user_id: str) -> list[dict]:
 def upload_file_to_cloud(user_id: str, file_bytes: bytes, filename: str) -> str:
     cloud_path = f"{user_id}/{filename}"
 
-    # Detect correct content-type instead of hardcoding application/pdf
     content_type, _ = mimetypes.guess_type(filename)
     if not content_type:
         content_type = "application/octet-stream"
@@ -89,7 +94,7 @@ def upload_file_to_cloud(user_id: str, file_bytes: bytes, filename: str) -> str:
         file=file_bytes,
         file_options={
             "content-type": content_type,
-            "upsert": "true",   # overwrite if the same filename is re-uploaded
+            "upsert": "true",
         }
     )
 
