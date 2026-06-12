@@ -143,6 +143,20 @@ def create_rag_chain(llm_client, prompt_template: str):
     return SimpleChain(llm_client, prompt_template)
 
 
+def _thinking_supported() -> bool:
+    """True only if the installed google-genai's ThinkingConfig accepts
+    `thinking_budget`. Older builds (e.g. 1.2.0) don't, so we skip that path
+    entirely instead of triggering a guaranteed error every request."""
+    try:
+        fields = getattr(genai_types.ThinkingConfig, "model_fields", {})
+        return "thinking_budget" in fields
+    except Exception:
+        return False
+
+
+_THINKING_OK = _thinking_supported()
+
+
 def _generate(client, prompt_text):
     """
     Call Gemini robustly across google-genai versions.
@@ -155,7 +169,8 @@ def _generate(client, prompt_text):
     thinking_budget = int(os.getenv("GEMINI_THINKING", "512"))
 
     # Attempt 1: full config with a small thinking budget (best quality).
-    if thinking_budget >= 0:
+    # Only attempted if the installed library actually supports the field.
+    if _THINKING_OK and thinking_budget >= 0:
         try:
             cfg = genai_types.GenerateContentConfig(
                 temperature=0.3,
@@ -261,6 +276,15 @@ def rerank_chunks(query, chunks, reranker):
         chunk["rerank_score"] = round(float(scores[i]), 4)
 
     reranked = sorted(chunks, key=lambda x: x["rerank_score"], reverse=True)
+
+    # Free the cross-encoder's transient working tensors right away.
+    del scores, documents
+    try:
+        from services.mem import release_memory
+        release_memory()
+    except Exception:
+        pass
+
     return reranked[:top_n]
 
 
