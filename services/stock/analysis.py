@@ -1,65 +1,227 @@
 """
-services/stock/analysis.py — Capital Pulse stock intelligence (memory-safe port).
+services/stock/analysis.py — Capital Pulse stock intelligence (memory-safe).
 
-Adapted from the GDG "Capital Pulse" project (Vijay Chamyal) to run within
-Render's 512 MB free-tier budget:
+Why no yfinance/pandas/torch/Prophet?
+  * yfinance is rate-limited/blocked on cloud server IPs (HTTP 429 from Yahoo),
+    so it fails for every ticker on Render.
+  * pandas (pulled in by yfinance) adds ~150 MB, which pushed the whole service
+    over Render's 512 MB cap and was killing document uploads mid-request.
 
-  * Analytical chatbot  -> yfinance + Finnhub + the EXISTING google-genai client
-                           (no LangChain / FAISS / HuggingFace embeddings).
-  * Price prediction    -> lightweight trend forecast with numpy + scikit-learn
-                           (no PyTorch / Prophet, which alone exceed the RAM cap).
+So this module uses:
+  * Stooq  (free CSV endpoint, no API key, works from datacenter IPs) for
+           historical daily closes  -> prediction + price summary.
+  * Finnhub (lightweight REST, optional key) for company profile, live quote
+            and news -> analytical chatbot.
+  * numpy + scikit-learn (already core deps) for the lightweight forecaster.
 
-The full LSTM + Prophet Streamlit version still lives in the GDG repo and can be
-run locally; this module gives the same *experience* (forecast chart + metrics +
-explanatory chatbot) inside CortexOS without blowing the memory limit.
+The original LSTM + Prophet Streamlit version still lives in the GDG repo for
+local use; this gives the same experience without exceeding the memory budget.
 """
 
+import csv
+import io
+import json
 import os
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta
 
 import numpy as np
 
-# ── Ticker shortcuts (same idea as the original) ──────────────────────────────
+# ── Company name -> ticker shortcuts ──────────────────────────────────────────
 TICKER_MAP = {
     "apple": "AAPL", "microsoft": "MSFT", "google": "GOOGL", "alphabet": "GOOGL",
     "amazon": "AMZN", "meta": "META", "facebook": "META", "tesla": "TSLA",
     "nvidia": "NVDA", "netflix": "NFLX", "intel": "INTC", "amd": "AMD",
     "disney": "DIS", "ibm": "IBM", "oracle": "ORCL", "adobe": "ADBE",
+    "reliance": "RELIANCE.NS", "tcs": "TCS.NS", "infosys": "INFY.NS",
+    "hdfc": "HDFCBANK.NS", "wipro": "WIPRO.NS", "tata motors": "TATAMOTORS.NS",
+    "sbi": "SBIN.NS", "adani": "ADANIENT.NS", "itc": "ITC.NS",
+}
+
+# Words that look like tickers but aren't (avoids matching "FOR", "SHORT", etc.)
+_STOPWORDS = {
+    "THE", "FOR", "AND", "WHY", "DID", "HAS", "WAS", "ARE", "WHAT", "HOW",
+    "WHEN", "WHO", "DOES", "DID", "IS", "IN", "ON", "OF", "TO", "A", "AN",
+    "STOCK", "STOCKS", "PRICE", "SHARE", "SHARES", "SHORT", "LONG", "BUY",
+    "SELL", "UP", "DOWN", "DROP", "RISE", "NEWS", "TODAY", "NOW", "ABOUT",
+    "WITH", "THIS", "THAT", "TELL", "ME", "GET", "RECENT", "RECENTLY", "MOVE",
+    "MOVED", "MARKET", "HAPPENING", "GOING",
 }
 
 
-# ── Lazy imports so the doc pipeline never pays for these unless used ──────────
-def _yf():
-    import yfinance as yf
-    return yf
+def _http_get(url: str, timeout: int = 15) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (CortexOS)"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", "replace")
 
 
-def _finnhub_client():
-    api_key = os.getenv("FINNHUB_API_KEY") or os.getenv("finnhub_api_key")
-    if not api_key:
+# ── Stooq historical prices (reliable from servers) ───────────────────────────
+def _stooq_candidates(ticker: str):
+    """Build candidate Stooq symbols. Stooq uses lowercase + exchange suffix:
+    US -> aapl.us, India(NSE) -> reliance.in, etc."""
+    t = ticker.strip().lower()
+    cands = []
+    if "." in t:
+        base, suf = t.rsplit(".", 1)
+        if suf in ("ns", "bo"):          # Indian NSE/BSE
+            cands += [f"{base}.in", base]
+        elif suf == "us":
+            cands += [t, base]
+        else:
+            cands += [t, base]
+    else:
+        cands += [f"{t}.us", f"{t}.in", t]
+    out, seen = [], set()
+    for c in cands:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def fetch_history(ticker: str):
+    """Return list of (date_str, close_float) sorted oldest->newest, or None."""
+    for sym in _stooq_candidates(ticker):
+        url = f"https://stooq.com/q/d/l/?s={urllib.parse.quote(sym)}&i=d"
+        try:
+            text = _http_get(url)
+        except Exception as e:
+            print(f"[stock] stooq fetch error for {sym}: {e}")
+            continue
+
+        lines = text.strip().splitlines()
+        if not lines or not lines[0].lower().startswith("date,"):
+            continue  # invalid symbol -> "No data" / html
+        try:
+            rows = list(csv.DictReader(io.StringIO(text)))
+        except Exception:
+            continue
+
+        series = []
+        for r in rows:
+            c = r.get("Close")
+            d = r.get("Date")
+            if not c or c in ("N/D", "null") or not d:
+                continue
+            try:
+                series.append((d, float(c)))
+            except ValueError:
+                continue
+        if len(series) >= 30:
+            return series
+    return None
+
+
+# ── Finnhub (news / profile / quote) ──────────────────────────────────────────
+def _finnhub_key():
+    return os.getenv("FINNHUB_API_KEY") or os.getenv("finnhub_api_key")
+
+
+def _finnhub_get(path: str, params: dict):
+    key = _finnhub_key()
+    if not key:
         return None
+    params = {**params, "token": key}
+    url = f"https://finnhub.io/api/v1/{path}?{urllib.parse.urlencode(params)}"
     try:
-        import finnhub
-        return finnhub.Client(api_key=api_key)
+        return json.loads(_http_get(url))
     except Exception as e:
-        print(f"[stock] finnhub init failed: {e}")
+        print(f"[stock] finnhub {path} error: {e}")
         return None
+
+
+def get_company_info(ticker: str) -> str:
+    data = _finnhub_get("stock/profile2", {"symbol": ticker})
+    if not data or not data.get("name"):
+        return ""
+    mcap = data.get("marketCapitalization")
+    mcap_str = f"${mcap:,.0f}M" if isinstance(mcap, (int, float)) else "N/A"
+    return (
+        "COMPANY INFO:\n"
+        f"Name: {data.get('name', ticker)}\n"
+        f"Industry: {data.get('finnhubIndustry', 'N/A')}\n"
+        f"Exchange: {data.get('exchange', 'N/A')}\n"
+        f"Market Cap: {mcap_str}\n"
+    )
+
+
+def get_quote_summary(ticker: str) -> str:
+    q = _finnhub_get("quote", {"symbol": ticker})
+    if not q or not q.get("c"):
+        return ""
+    change = q.get("dp")
+    return (
+        "LIVE QUOTE:\n"
+        f"Current: ${q.get('c'):.2f}\n"
+        f"Open: ${q.get('o'):.2f}  High: ${q.get('h'):.2f}  Low: ${q.get('l'):.2f}\n"
+        f"Prev Close: ${q.get('pc'):.2f}\n"
+        f"Day Change: {change:+.2f}%\n" if change is not None else ""
+    )
+
+
+def get_history_summary(ticker: str, days: int = 30) -> str:
+    series = fetch_history(ticker)
+    if not series:
+        return ""
+    window = series[-days:]
+    start, end = window[0][1], window[-1][1]
+    change = ((end - start) / start) * 100 if start else 0
+    highs = max(v for _, v in window)
+    lows = min(v for _, v in window)
+    return (
+        f"PRICE TREND (last {len(window)} trading days):\n"
+        f"Start: ${start:.2f}  ->  Latest: ${end:.2f}\n"
+        f"Change: {change:+.2f}%\n"
+        f"High: ${highs:.2f}  Low: ${lows:.2f}\n"
+    )
+
+
+def get_news(ticker: str, days: int = 21) -> str:
+    today = datetime.now().strftime("%Y-%m-%d")
+    start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    articles = _finnhub_get("company-news", {"symbol": ticker, "from": start, "to": today})
+    if not articles or not isinstance(articles, list):
+        return ""
+    out = "RECENT NEWS:\n"
+    for a in articles[:10]:
+        d = datetime.fromtimestamp(a.get("datetime", 0)).strftime("%Y-%m-%d")
+        out += f"\n[{d}] {a.get('headline', 'No title')}\n"
+        if a.get("summary"):
+            out += f"{a['summary'][:280]}\n"
+    return out
+
+
+def build_context(ticker: str) -> str:
+    parts = [
+        get_company_info(ticker),
+        get_quote_summary(ticker),
+        get_history_summary(ticker),
+        get_news(ticker),
+    ]
+    return "\n".join(p for p in parts if p)
 
 
 # ── Ticker resolution ─────────────────────────────────────────────────────────
 def resolve_ticker(query: str, llm_client=None) -> str:
     q = (query or "").lower()
-    for name, tk in TICKER_MAP.items():
+
+    # 1. Known company names (longest first so "tata motors" beats "tata")
+    for name in sorted(TICKER_MAP, key=len, reverse=True):
         if name in q:
-            return tk
+            return TICKER_MAP[name]
 
-    # If it already looks like a ticker (1-5 uppercase letters), accept it.
-    for token in (query or "").replace("?", " ").split():
-        t = token.strip().upper()
-        if 1 <= len(t) <= 5 and t.isalpha():
-            return t
+    # 2. Explicit uppercase ticker typed in the ORIGINAL text (e.g. "AAPL"),
+    #    skipping common English words.
+    for raw in (query or "").replace("?", " ").replace(",", " ").split():
+        token = raw.strip(".:;!").upper()
+        if (raw.strip(".:;!").isupper()
+                and 1 <= len(token) <= 5
+                and token.isalpha()
+                and token not in _STOPWORDS):
+            return token
 
-    # LLM fallback (optional)
+    # 3. LLM fallback (optional)
     if llm_client is not None:
         try:
             from services.document_chat.config import retrieval_config
@@ -67,110 +229,17 @@ def resolve_ticker(query: str, llm_client=None) -> str:
                 model=retrieval_config.gemini_model,
                 contents=(
                     "Extract ONLY the stock ticker symbol from this query "
-                    "(e.g. Apple -> AAPL). Reply with just the symbol, or "
-                    f"UNKNOWN if none.\nQuery: {query}\nTicker:"
+                    "(e.g. Apple -> AAPL, Reliance -> RELIANCE.NS). Reply with "
+                    f"just the symbol, or UNKNOWN.\nQuery: {query}\nTicker:"
                 ),
             )
             cand = (resp.text or "").strip().upper().split()[0] if resp.text else ""
-            if cand and cand != "UNKNOWN" and cand.isalpha():
+            cand = cand.strip(".:;!")
+            if cand and cand != "UNKNOWN" and cand not in _STOPWORDS:
                 return cand
         except Exception as e:
             print(f"[stock] ticker LLM fallback failed: {e}")
     return ""
-
-
-# ── Data fetching helpers ─────────────────────────────────────────────────────
-def _history(ticker: str, period: str = "1y"):
-    yf = _yf()
-    try:
-        df = yf.Ticker(ticker).history(period=period, auto_adjust=True)
-        if df is None or df.empty:
-            return None
-        return df
-    except Exception as e:
-        print(f"[stock] history error for {ticker}: {e}")
-        return None
-
-
-def get_company_info(ticker: str) -> str:
-    try:
-        info = _yf().Ticker(ticker).info or {}
-        return (
-            "COMPANY INFO:\n"
-            f"Name: {info.get('longName', ticker)}\n"
-            f"Sector: {info.get('sector', 'N/A')}\n"
-            f"Industry: {info.get('industry', 'N/A')}\n"
-            f"Market Cap: ${info.get('marketCap', 0):,.0f}\n"
-        )
-    except Exception:
-        return ""
-
-
-def get_price_summary(ticker: str, days: int = 30) -> str:
-    df = _history(ticker, period="3mo")
-    if df is None:
-        return ""
-    closes = df["Close"].dropna()
-    if closes.empty:
-        return ""
-    window = closes.tail(days)
-    change = ((window.iloc[-1] - window.iloc[0]) / window.iloc[0]) * 100
-    return (
-        f"PRICE DATA (last {len(window)} trading days):\n"
-        f"Current: ${window.iloc[-1]:.2f}\n"
-        f"Start: ${window.iloc[0]:.2f}\n"
-        f"Change: {change:+.2f}%\n"
-        f"High: ${window.max():.2f}\n"
-        f"Low: ${window.min():.2f}\n"
-    )
-
-
-def get_finnhub_news(ticker: str, days: int = 21) -> str:
-    client = _finnhub_client()
-    if client is None:
-        return ""
-    try:
-        today = datetime.now().strftime("%Y-%m-%d")
-        start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-        articles = client.company_news(ticker, _from=start, to=today) or []
-        if not articles:
-            return ""
-        out = "RECENT NEWS:\n"
-        for a in articles[:10]:
-            d = datetime.fromtimestamp(a.get("datetime", 0)).strftime("%Y-%m-%d")
-            out += f"\n[{d}] {a.get('headline', 'No title')}\n"
-            if a.get("summary"):
-                out += f"{a['summary'][:300]}\n"
-        return out
-    except Exception as e:
-        print(f"[stock] finnhub news error: {e}")
-        return ""
-
-
-def get_yfinance_news(ticker: str) -> str:
-    try:
-        news = _yf().Ticker(ticker).news or []
-        if not news:
-            return ""
-        out = "\nADDITIONAL HEADLINES:\n"
-        for item in news[:8]:
-            content = item.get("content", item)
-            title = content.get("title") or item.get("title") or "No title"
-            out += f"\n- {title}\n"
-        return out
-    except Exception as e:
-        print(f"[stock] yfinance news error: {e}")
-        return ""
-
-
-def build_context(ticker: str) -> str:
-    parts = [
-        get_company_info(ticker),
-        get_price_summary(ticker),
-        get_finnhub_news(ticker),
-        get_yfinance_news(ticker),
-    ]
-    return "\n".join(p for p in parts if p)
 
 
 # ── Analytical chatbot ────────────────────────────────────────────────────────
@@ -207,12 +276,15 @@ def stock_chat(question: str, llm_client) -> dict:
 
     context = build_context(ticker)
     if len(context) < 80:
+        note = "" if _finnhub_key() else (
+            " (Tip: set FINNHUB_API_KEY on the server to enable live news & "
+            "company data.)"
+        )
         return {
             "ticker": ticker,
             "answer": (
-                f"I couldn't pull enough live data for {ticker} right now "
-                "(it may be an invalid ticker or a temporary data/API limit). "
-                "Please try again shortly."
+                f"I couldn't pull enough live data for {ticker} right now."
+                f"{note} Please try again shortly or try a different ticker."
             ),
         }
 
@@ -239,16 +311,15 @@ def stock_chat(question: str, llm_client) -> dict:
     return {"ticker": ticker, "answer": answer}
 
 
-# ── Lightweight price prediction (no torch / Prophet) ─────────────────────────
+# ── Lightweight price prediction (numpy + scikit-learn) ───────────────────────
 def _metrics(actual: np.ndarray, pred: np.ndarray) -> dict:
     actual = np.asarray(actual, dtype=float)
     pred = np.asarray(pred, dtype=float)
     rmse = float(np.sqrt(np.mean((actual - pred) ** 2)))
     mae = float(np.mean(np.abs(actual - pred)))
-    # avoid division by zero
     nonzero = actual != 0
-    mape = float(np.mean(np.abs((actual[nonzero] - pred[nonzero]) / actual[nonzero])) * 100) \
-        if nonzero.any() else 0.0
+    mape = (float(np.mean(np.abs((actual[nonzero] - pred[nonzero]) / actual[nonzero])) * 100)
+            if nonzero.any() else 0.0)
     return {
         "rmse": round(rmse, 3),
         "mae": round(mae, 3),
@@ -258,11 +329,8 @@ def _metrics(actual: np.ndarray, pred: np.ndarray) -> dict:
 
 
 def _trend_forecast(series: np.ndarray, horizon: int) -> np.ndarray:
-    """
-    Lightweight forecaster: linear trend (least squares) on a recent window
-    blended with the last observed value, plus the average recent daily change.
-    Memory-safe and fast — a sensible stand-in for the heavy LSTM/Prophet models.
-    """
+    """Linear trend (least squares) on a recent window blended with recent
+    momentum, anchored to the last observed price. Fast and memory-safe."""
     from sklearn.linear_model import LinearRegression
 
     n = len(series)
@@ -275,30 +343,29 @@ def _trend_forecast(series: np.ndarray, horizon: int) -> np.ndarray:
     trend = reg.predict(future_x).flatten()
 
     last = float(series[-1])
-    # recent average daily change (momentum)
     recent = series[-min(n, 10):]
     drift = float(np.mean(np.diff(recent))) if len(recent) > 1 else 0.0
-
     drift_path = last + drift * np.arange(1, horizon + 1)
 
-    # Blend trend and momentum, anchored to the last actual price.
     forecast = 0.6 * trend + 0.4 * drift_path
-    # ensure continuity: shift so day-1 connects smoothly to last value
     forecast = forecast + (last - forecast[0]) * np.linspace(1, 0, horizon)
     return forecast
 
 
 def predict_prices(ticker: str, horizon: int = 7) -> dict:
-    df = _history(ticker, period="1y")
-    if df is None:
-        return {"error": f"No data found for '{ticker}'. Check the ticker symbol."}
+    series = fetch_history(ticker)
+    if not series:
+        return {
+            "error": (
+                f"No price data found for '{ticker}'. Check the symbol "
+                "(US e.g. AAPL; Indian e.g. RELIANCE.NS)."
+            )
+        }
 
-    closes = df["Close"].dropna()
-    if len(closes) < 30:
+    dates = [d for d, _ in series]
+    values = np.array([v for _, v in series], dtype=float)
+    if len(values) < 30:
         return {"error": f"Not enough price history for '{ticker}'."}
-
-    dates = [d.strftime("%Y-%m-%d") for d in closes.index]
-    values = closes.values.astype(float)
 
     # Backtest on the last `horizon` days for honest metrics.
     train, test = values[:-horizon], values[-horizon:]
@@ -307,18 +374,17 @@ def predict_prices(ticker: str, horizon: int = 7) -> dict:
 
     # Real future forecast.
     future = _trend_forecast(values, horizon)
-    last_date = closes.index[-1]
+    last_date = datetime.strptime(dates[-1], "%Y-%m-%d")
     future_dates = [(last_date + timedelta(days=i)).strftime("%Y-%m-%d")
                     for i in range(1, horizon + 1)]
 
-    # Trim history sent to the client to keep payload light.
-    hist_dates = dates[-180:]
-    hist_values = [round(v, 2) for v in values[-180:]]
-
     return {
         "ticker": ticker.upper(),
-        "model": "Lightweight trend + momentum (memory-safe)",
-        "history": {"dates": hist_dates, "prices": hist_values},
+        "model": "Trend + momentum regression (memory-safe)",
+        "history": {
+            "dates": dates[-180:],
+            "prices": [round(float(v), 2) for v in values[-180:]],
+        },
         "forecast": {
             "dates": future_dates,
             "prices": [round(float(p), 2) for p in future],
