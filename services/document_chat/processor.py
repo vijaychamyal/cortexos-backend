@@ -1,12 +1,13 @@
 import os
 from qdrant_client import QdrantClient
-from sentence_transformers import SentenceTransformer, CrossEncoder
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from dotenv import load_dotenv
 from .config import retrieval_config, collection_name
 from qdrant_client.http import models
+from fastembed.rerank.cross_encoder import TextCrossEncoder
+from fastembed import TextEmbedding
 
 top_k = retrieval_config.top_k #from qdrant
 top_n = retrieval_config.top_n
@@ -31,13 +32,17 @@ def setup_qdrant():
         raise e
 
 # load the same minilm model used in embed.py
+
+
 def load_model():
-    model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    print("[AI Engine] Loading MiniLM via fastembed...")
+    model = TextEmbedding("sentence-transformers/all-MiniLM-L6-v2")
     return model
 
 # load cross encoder for reranking
+
 def load_reranker():
-    reranker = CrossEncoder(retrieval_config.rerank_model)
+    reranker = TextCrossEncoder("Xenova/ms-marco-MiniLM-L-6-v2")
     return reranker
 
 
@@ -107,10 +112,7 @@ def create_rag_chain(llm, prompt):
 #     return chunks
 # search qdrant for top k relevant chunks, filtered by filename if provided
 def search_qdrant(query, model, client, filename=None):
-    query_vector = model.encode(
-        query,
-        normalize_embeddings=True
-    ).tolist()
+    query_vector = list(model.embed([query]))[0].tolist()
 
     # Build the strict filter
     query_filter = None
@@ -149,20 +151,14 @@ def rerank_chunks(query, chunks, reranker):
     if not chunks:
         return []
 
-    pairs  = [(query, chunk["text"]) for chunk in chunks]
-    scores = reranker.predict(pairs)
+    documents = [chunk["text"] for chunk in chunks]
+    scores = list(reranker.rerank(query, documents))
 
     for i, chunk in enumerate(chunks):
         chunk["rerank_score"] = round(float(scores[i]), 4)
 
-    reranked = sorted(
-        chunks,
-        key    =lambda x: x["rerank_score"],
-        reverse=True
-    )
-
-    top_chunks = reranked[:top_n]
-    return top_chunks
+    reranked = sorted(chunks, key=lambda x: x["rerank_score"], reverse=True)
+    return reranked[:top_n]
 
 
 # convert reranked chunks into a single context string

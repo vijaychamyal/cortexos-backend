@@ -1,11 +1,11 @@
 import re
 import os
-import torch
 
 from qdrant_client import QdrantClient
-from sentence_transformers import SentenceTransformer
 from .config import collection_name
 from .config import QdrantConfig
+from fastembed import TextEmbedding
+
 # symbol removal and text cleaning
 def clean_text(text):
     text = re.sub(r'\x00', ' ', text)
@@ -50,20 +50,10 @@ def setup_qdrant():
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 
-def load_model():
-    # 2. Force PyTorch itself to use exactly 1 CPU thread (Massive RAM savings)
-    torch.set_num_threads(1)
-    
-    print("[AI Engine] Loading MiniLM in low-memory CPU mode...")
-    
-    # 3. Explicitly tell the model to load only on the CPU
-    model = SentenceTransformer(
-        "sentence-transformers/all-MiniLM-L6-v2", 
-        device="cpu"
-    )
-    
-    return model
 
+def load_model():
+    model = TextEmbedding("sentence-transformers/all-MiniLM-L6-v2")
+    return model
 
 # verify insertion
 def verify_insert(client):

@@ -32,11 +32,5 @@ def make_chunks(pages):
 def embed_chunks(chunks, model):
     texts = [chunk["chunk_text"] for chunk in chunks]
     print(f"Embedding {len(texts)} chunks")
-    vectors = model.encode(
-        texts,
-        batch_size          =batch_size,
-        show_progress_bar   =True,
-        convert_to_numpy    =True,
-        normalize_embeddings=True
-    )
+    vectors = list(model.embed(texts, batch_size=batch_size))
     return vectors
