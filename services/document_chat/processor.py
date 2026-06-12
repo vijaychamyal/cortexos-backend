@@ -123,24 +123,7 @@ def create_rag_chain(llm_client, prompt_template: str):
                 context=inputs["context"],
                 question=inputs["question"]
             )
-            # We keep a SMALL thinking budget instead of disabling it. Disabling
-            # thinking entirely noticeably hurt answer quality; a small budget
-            # is a good balance of quality vs. latency. Tune via GEMINI_THINKING.
-            thinking_budget = int(os.getenv("GEMINI_THINKING", "512"))
-            config = genai_types.GenerateContentConfig(
-                temperature=0.3,
-                max_output_tokens=2048,
-            )
-            # thinking_budget=0 means "off"; -1 means "dynamic/unbounded".
-            if thinking_budget >= 0:
-                config.thinking_config = genai_types.ThinkingConfig(
-                    thinking_budget=thinking_budget
-                )
-            response = self._client.models.generate_content(
-                model=retrieval_config.gemini_model,
-                contents=prompt_text,
-                config=config,
-            )
+            response = _generate(self._client, prompt_text)
             # response.text can be None if the model returned no parts (e.g.
             # safety block or an empty thinking-only turn). Fall back gracefully
             # instead of letting a None crash the endpoint.
@@ -158,6 +141,49 @@ def create_rag_chain(llm_client, prompt_template: str):
                     "Please try rephrasing your question.")
 
     return SimpleChain(llm_client, prompt_template)
+
+
+def _generate(client, prompt_text):
+    """
+    Call Gemini robustly across google-genai versions.
+
+    Older google-genai builds don't accept `thinking_budget` (and some don't
+    accept a `config=` object at all). We try the richest call first and
+    progressively fall back so document chat never 500s on a version mismatch.
+    """
+    model = retrieval_config.gemini_model
+    thinking_budget = int(os.getenv("GEMINI_THINKING", "512"))
+
+    # Attempt 1: full config with a small thinking budget (best quality).
+    if thinking_budget >= 0:
+        try:
+            cfg = genai_types.GenerateContentConfig(
+                temperature=0.3,
+                max_output_tokens=2048,
+                thinking_config=genai_types.ThinkingConfig(
+                    thinking_budget=thinking_budget
+                ),
+            )
+            return client.models.generate_content(
+                model=model, contents=prompt_text, config=cfg
+            )
+        except Exception as e:
+            print(f"[llm] thinking_config not supported, retrying without it: {e}")
+
+    # Attempt 2: config without thinking.
+    try:
+        cfg = genai_types.GenerateContentConfig(
+            temperature=0.3,
+            max_output_tokens=2048,
+        )
+        return client.models.generate_content(
+            model=model, contents=prompt_text, config=cfg
+        )
+    except Exception as e:
+        print(f"[llm] config object not supported, retrying bare: {e}")
+
+    # Attempt 3: bare call (works on the oldest builds).
+    return client.models.generate_content(model=model, contents=prompt_text)
 
 
 # ── Qdrant search ─────────────────────────────────────────────────────────────

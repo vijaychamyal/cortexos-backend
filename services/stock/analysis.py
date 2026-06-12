@@ -51,23 +51,69 @@ _STOPWORDS = {
 
 
 def _http_get(url: str, timeout: int = 15) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (CortexOS)"})
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0 Safari/537.36",
+        "Accept": "application/json, text/csv, */*",
+    })
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode("utf-8", "replace")
 
 
-# ── Stooq historical prices (reliable from servers) ───────────────────────────
+# ── Yahoo v8 chart API (primary; no key, global + Indian coverage) ─────────────
+# NOTE: this is the lightweight /v8/finance/chart endpoint, NOT the
+# quoteSummary/crumb endpoints that yfinance uses and that get HTTP-429'd on
+# datacenter IPs. This one is far more permissive from servers.
+def _yahoo_symbols(ticker: str):
+    t = ticker.strip().upper()
+    cands = [t]
+    # Convenience: allow "RELIANCE" to also try the NSE listing.
+    if "." not in t:
+        cands.append(f"{t}.NS")
+    out, seen = [], set()
+    for c in cands:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def _fetch_yahoo(ticker: str):
+    for sym in _yahoo_symbols(ticker):
+        url = (f"https://query1.finance.yahoo.com/v8/finance/chart/"
+               f"{urllib.parse.quote(sym)}?range=1y&interval=1d")
+        try:
+            data = json.loads(_http_get(url))
+        except Exception as e:
+            print(f"[stock] yahoo fetch error for {sym}: {e}")
+            continue
+        try:
+            res = data["chart"]["result"][0]
+            ts = res["timestamp"]
+            closes = res["indicators"]["quote"][0]["close"]
+        except (KeyError, IndexError, TypeError):
+            continue
+        series = []
+        for t, c in zip(ts, closes):
+            if c is None:
+                continue
+            d = datetime.utcfromtimestamp(t).strftime("%Y-%m-%d")
+            series.append((d, float(c)))
+        if len(series) >= 30:
+            return series
+    return None
+
+
+# ── Stooq historical prices (fallback CSV source) ─────────────────────────────
 def _stooq_candidates(ticker: str):
-    """Build candidate Stooq symbols. Stooq uses lowercase + exchange suffix:
-    US -> aapl.us, India(NSE) -> reliance.in, etc."""
+    """Stooq uses lowercase + exchange suffix: US -> aapl.us, India -> reliance.in."""
     t = ticker.strip().lower()
     cands = []
     if "." in t:
         base, suf = t.rsplit(".", 1)
         if suf in ("ns", "bo"):          # Indian NSE/BSE
             cands += [f"{base}.in", base]
-        elif suf == "us":
-            cands += [t, base]
         else:
             cands += [t, base]
     else:
@@ -80,8 +126,7 @@ def _stooq_candidates(ticker: str):
     return out
 
 
-def fetch_history(ticker: str):
-    """Return list of (date_str, close_float) sorted oldest->newest, or None."""
+def _fetch_stooq(ticker: str):
     for sym in _stooq_candidates(ticker):
         url = f"https://stooq.com/q/d/l/?s={urllib.parse.quote(sym)}&i=d"
         try:
@@ -89,19 +134,16 @@ def fetch_history(ticker: str):
         except Exception as e:
             print(f"[stock] stooq fetch error for {sym}: {e}")
             continue
-
         lines = text.strip().splitlines()
         if not lines or not lines[0].lower().startswith("date,"):
-            continue  # invalid symbol -> "No data" / html
+            continue  # bot challenge / invalid symbol -> html
         try:
             rows = list(csv.DictReader(io.StringIO(text)))
         except Exception:
             continue
-
         series = []
         for r in rows:
-            c = r.get("Close")
-            d = r.get("Date")
+            c, d = r.get("Close"), r.get("Date")
             if not c or c in ("N/D", "null") or not d:
                 continue
             try:
@@ -111,6 +153,12 @@ def fetch_history(ticker: str):
         if len(series) >= 30:
             return series
     return None
+
+
+def fetch_history(ticker: str):
+    """Return list of (date_str, close_float) oldest->newest, or None.
+    Tries Yahoo chart API first (reliable from servers), then Stooq."""
+    return _fetch_yahoo(ticker) or _fetch_stooq(ticker)
 
 
 # ── Finnhub (news / profile / quote) ──────────────────────────────────────────
@@ -146,22 +194,8 @@ def get_company_info(ticker: str) -> str:
     )
 
 
-def get_quote_summary(ticker: str) -> str:
-    q = _finnhub_get("quote", {"symbol": ticker})
-    if not q or not q.get("c"):
-        return ""
-    change = q.get("dp")
-    return (
-        "LIVE QUOTE:\n"
-        f"Current: ${q.get('c'):.2f}\n"
-        f"Open: ${q.get('o'):.2f}  High: ${q.get('h'):.2f}  Low: ${q.get('l'):.2f}\n"
-        f"Prev Close: ${q.get('pc'):.2f}\n"
-        f"Day Change: {change:+.2f}%\n" if change is not None else ""
-    )
-
-
-def get_history_summary(ticker: str, days: int = 30) -> str:
-    series = fetch_history(ticker)
+def get_history_summary(series, days: int = 30) -> str:
+    """Build a price-trend summary from an already-fetched series."""
     if not series:
         return ""
     window = series[-days:]
@@ -171,9 +205,9 @@ def get_history_summary(ticker: str, days: int = 30) -> str:
     lows = min(v for _, v in window)
     return (
         f"PRICE TREND (last {len(window)} trading days):\n"
-        f"Start: ${start:.2f}  ->  Latest: ${end:.2f}\n"
+        f"Start: {start:.2f}  ->  Latest: {end:.2f}\n"
         f"Change: {change:+.2f}%\n"
-        f"High: ${highs:.2f}  Low: ${lows:.2f}\n"
+        f"High: {highs:.2f}  Low: {lows:.2f}\n"
     )
 
 
@@ -193,11 +227,12 @@ def get_news(ticker: str, days: int = 21) -> str:
 
 
 def build_context(ticker: str) -> str:
+    # Price history comes from the reliable Yahoo chart API (no key needed).
+    series = fetch_history(ticker)
     parts = [
-        get_company_info(ticker),
-        get_quote_summary(ticker),
-        get_history_summary(ticker),
-        get_news(ticker),
+        get_company_info(ticker),       # Finnhub (optional)
+        get_history_summary(series),    # always available if ticker is valid
+        get_news(ticker),               # Finnhub (optional)
     ]
     return "\n".join(p for p in parts if p)
 
@@ -275,33 +310,27 @@ def stock_chat(question: str, llm_client) -> dict:
         }
 
     context = build_context(ticker)
-    if len(context) < 80:
+    if len(context) < 40:
         note = "" if _finnhub_key() else (
             " (Tip: set FINNHUB_API_KEY on the server to enable live news & "
-            "company data.)"
+            "company data — price analysis works without it.)"
         )
         return {
             "ticker": ticker,
             "answer": (
                 f"I couldn't pull enough live data for {ticker} right now."
-                f"{note} Please try again shortly or try a different ticker."
+                f"{note} Please double-check the ticker (US e.g. AAPL; Indian "
+                "e.g. RELIANCE.NS) or try again shortly."
             ),
         }
 
-    from services.document_chat.config import retrieval_config
-    from google.genai import types as genai_types
-
     prompt = STOCK_PROMPT.format(context=context, question=question)
     try:
-        resp = llm_client.models.generate_content(
-            model=retrieval_config.gemini_model,
-            contents=prompt,
-            config=genai_types.GenerateContentConfig(
-                temperature=0.3,
-                max_output_tokens=2048,
-            ),
-        )
-        answer = (resp.text or "").strip() or (
+        # Reuse the version-robust Gemini caller from the document chat module
+        # so we don't 500 on google-genai version differences.
+        from services.document_chat.processor import _generate
+        resp = _generate(llm_client, prompt)
+        answer = (getattr(resp, "text", None) or "").strip() or (
             "I couldn't generate an analysis for that. Please rephrase."
         )
     except Exception as e:
