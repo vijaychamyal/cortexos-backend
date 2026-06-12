@@ -352,7 +352,11 @@ def main_pipeline(file_path: str, user_id: str, qdrant_client=None, embedding_mo
     inserted = insert_stream_to_qdrant(chunks, vector_iter, client)
 
     del texts, vector_iter, chunks
-    gc.collect()
+    try:
+        from services.mem import release_memory
+        release_memory()
+    except Exception:
+        gc.collect()
 
     print(f"[Pipeline] Done. Inserted {inserted} chunks for user {user_id}.")
     return client, model
