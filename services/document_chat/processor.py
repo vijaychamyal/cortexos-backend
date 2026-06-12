@@ -4,6 +4,7 @@ from qdrant_client.http import models
 from fastembed.rerank.cross_encoder import TextCrossEncoder
 from fastembed import TextEmbedding
 from google import genai
+from google.genai import types as genai_types
 from dotenv import load_dotenv
 from .config import retrieval_config, collection_name
 
@@ -11,6 +12,11 @@ top_k = retrieval_config.top_k
 top_n = retrieval_config.top_n
 
 load_dotenv()
+
+# Reranking adds CPU latency and ~100-150 MB RAM (the cross-encoder model).
+# Set USE_RERANKER=false on Render if you ever hit memory pressure — search
+# quality drops slightly but it's faster and lighter.
+USE_RERANKER = os.getenv("USE_RERANKER", "true").lower() not in ("false", "0", "no")
 
 # ── Qdrant ────────────────────────────────────────────────────────────────────
 
@@ -110,9 +116,17 @@ def create_rag_chain(llm_client, prompt_template: str):
                 context=inputs["context"],
                 question=inputs["question"]
             )
+            # thinking_budget=0 disables Gemini 2.5's "thinking" phase, which
+            # otherwise adds several seconds of latency per answer. Capping
+            # max_output_tokens also keeps responses snappy.
             response = self._client.models.generate_content(
                 model=retrieval_config.gemini_model,
-                contents=prompt_text
+                contents=prompt_text,
+                config=genai_types.GenerateContentConfig(
+                    thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
+                    max_output_tokens=1024,
+                    temperature=0.2,
+                ),
             )
             return response.text
 
@@ -169,6 +183,10 @@ def rerank_chunks(query, chunks, reranker):
     """reranker may be the 'lazy' sentinel string or None — both handled."""
     if not chunks:
         return []
+
+    # If reranking is disabled, just trust Qdrant's vector similarity order.
+    if not USE_RERANKER:
+        return chunks[:top_n]
 
     actual_reranker = _get_reranker()
     documents = [chunk["text"] for chunk in chunks]

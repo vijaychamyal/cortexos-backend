@@ -27,6 +27,13 @@ ai_models = {}
 async def lifespan(app: FastAPI):
     print("\n[CortexOS] Initializing AI Engines and Database Connections...")
     ai_models["qdrant_client"]  = setup_qdrant()
+    # Ensure the existing collection has the payload indexes that filtered
+    # chat search needs (fixes 400 "Index required but not found for user_id").
+    try:
+        from services.document_chat.database import create_collection
+        create_collection(ai_models["qdrant_client"])
+    except Exception as e:
+        print(f"[CortexOS] index ensure at startup failed (non-fatal): {e}")
     ai_models["embedding_model"] = load_model()
     ai_models["reranker_model"]  = load_reranker()   # lazy sentinel
     ai_models["gemini_llm"]      = load_llm()

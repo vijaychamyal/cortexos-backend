@@ -8,6 +8,34 @@ batch_size   = config.batch_size
 insert_batch = config.insert_batch
 
 
+def ensure_payload_indexes(client):
+    """
+    Make sure the payload indexes needed for filtered search exist.
+    Filtering by `user_id` / `source` during chat REQUIRES a keyword index;
+    without it Qdrant returns 400 "Index required but not found".
+
+    Each index is created independently and idempotently so an older
+    collection (created before indexes existed) gets upgraded automatically.
+    wait=True forces Qdrant to actually build the index before returning.
+    """
+    for field in ("source", "user_id"):
+        try:
+            client.create_payload_index(
+                collection_name=collection_name,
+                field_name=field,
+                field_schema="keyword",
+                wait=True,
+            )
+            print(f"Payload index ensured for '{field}'.")
+        except Exception as e:
+            # Already-exists errors are fine; log anything else but don't crash.
+            msg = str(e).lower()
+            if "already exists" in msg or "already created" in msg:
+                print(f"Payload index for '{field}' already exists.")
+            else:
+                print(f"[warn] could not create index for '{field}': {e}")
+
+
 def create_collection(client):
     existing = [c.name for c in client.get_collections().collections]
 
@@ -22,17 +50,7 @@ def create_collection(client):
         print(f"Collection '{collection_name}' created.")
 
     # Always ensure indexes exist (safe to call even if they already exist)
-    client.create_payload_index(
-        collection_name=collection_name,
-        field_name="source",
-        field_schema="keyword"
-    )
-    client.create_payload_index(
-        collection_name=collection_name,
-        field_name="user_id",
-        field_schema="keyword"
-    )
-    print("Payload indexes ensured for 'source' and 'user_id'.")
+    ensure_payload_indexes(client)
 
 
 def _id_offset(client):
