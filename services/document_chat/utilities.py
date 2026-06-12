@@ -1,4 +1,7 @@
 import re
+import os
+import torch
+
 from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
 from .config import collection_name
@@ -42,8 +45,23 @@ def setup_qdrant():
         print("First run: docker run -p 6333:6333 qdrant/qdrant")
         raise e
 
+
+# 1. Force low-level C++ libraries to only use 1 thread (must be set before model loads)
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 def load_model():
-    model= SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    # 2. Force PyTorch itself to use exactly 1 CPU thread (Massive RAM savings)
+    torch.set_num_threads(1)
+    
+    print("[AI Engine] Loading MiniLM in low-memory CPU mode...")
+    
+    # 3. Explicitly tell the model to load only on the CPU
+    model = SentenceTransformer(
+        "sentence-transformers/all-MiniLM-L6-v2", 
+        device="cpu"
+    )
+    
     return model
 
 
