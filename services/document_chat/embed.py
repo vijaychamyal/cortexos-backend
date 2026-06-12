@@ -4,7 +4,7 @@ import os
 import fitz
 import io
 import subprocess
-import openpyxl 
+import openpyxl
 
 from PIL import Image
 from pptx import Presentation
@@ -18,6 +18,7 @@ from .utilities import clean_text, is_garbage_text, setup_qdrant, load_model, ve
 load_dotenv()
 
 groq_client = groq.Groq(api_key=os.getenv("groq_api_key"))
+
 
 def analyze_image_with_groq(image: Image.Image) -> str:
     buffer = io.BytesIO()
@@ -43,7 +44,7 @@ def analyze_image_with_groq(image: Image.Image) -> str:
 def concatenate_images_vertically(images: list[Image.Image], max_pixels=30000000) -> Image.Image:
     if not images:
         return None
-    
+
     max_width = max(img.width for img in images)
     resized = []
     for img in images:
@@ -51,20 +52,21 @@ def concatenate_images_vertically(images: list[Image.Image], max_pixels=30000000
             ratio = max_width / img.width
             img = img.resize((max_width, int(img.height * ratio)), Image.LANCZOS)
         resized.append(img)
-    
+
     total_height = sum(img.height for img in resized)
     combined = Image.new('RGB', (max_width, total_height), 'white')
     y = 0
     for img in resized:
         combined.paste(img, (0, y))
         y += img.height
-    
+
     if combined.width * combined.height > max_pixels:
         scale = (max_pixels / (combined.width * combined.height)) ** 0.5
         combined = combined.resize((int(combined.width * scale), int(combined.height * scale)), Image.LANCZOS)
-    
+
     return combined
-    
+
+
 def load_ppt(file_path):
     original_path = file_path
     temp_converted = False
@@ -74,15 +76,15 @@ def load_ppt(file_path):
         subprocess.run(cmd, check=True, capture_output=True, timeout=60)
         file_path = file_path.replace('.ppt', '.pptx')
         temp_converted = True
-    
+
     filename = os.path.basename(original_path)
     prs = Presentation(file_path)
-    
+
     all_slides = []
     for slide_num, slide in enumerate(prs.slides):
         slide_text = []
         slide_images = []
-        
+
         for shape in slide.shapes:
             if shape.has_text_frame:
                 for para in shape.text_frame.paragraphs:
@@ -92,55 +94,51 @@ def load_ppt(file_path):
             elif shape.shape_type == 13:
                 try:
                     slide_images.append(Image.open(io.BytesIO(shape.image.blob)))
-                except:
+                except Exception:
                     pass
-        
+
         all_slides.append({'num': slide_num, 'text': slide_text, 'images': slide_images})
-    
+
     pages = []
     for i in range(0, len(all_slides), 3):
-        batch = all_slides[i:i+3]
+        batch = all_slides[i:i + 3]
         batch_images = [img for s in batch for img in s['images']]
-        
+
         image_text = ""
         if batch_images:
             combined = concatenate_images_vertically(batch_images)
             image_text = analyze_image_with_groq(combined)
-        
+
         for s in batch:
             full_text = " ".join(s['text']) + " " + image_text
             cleaned = clean_text(" ".join(full_text.split()))
-            
+
             if len(cleaned.strip()) >= 3:
                 pages.append({
-                    "text": cleaned,
+                    "text":     cleaned,
                     "page_num": s['num'] + 1,
-                    "source": filename
+                    "source":   filename
                 })
-    
+
     if temp_converted and os.path.exists(file_path):
         os.remove(file_path)
     return pages
+
+
 def extract_images_text_from_pdf_page(doc, page):
     image_texts = []
-    image_list = page.get_images(full=True)
-    
-    for img in image_list:
-        xref = img[0]#unique id for imag
+    for img in page.get_images(full=True):
+        xref = img[0]
         try:
-            base_image  = doc.extract_image(xref) #extract raw image byte from pdf
-            image_bytes = base_image["image"]
-            image    = Image.open(io.BytesIO(image_bytes))
-            ocr_text = analyze_image_with_groq(image)
-            
+            base_image  = doc.extract_image(xref)
+            image       = Image.open(io.BytesIO(base_image["image"]))
+            ocr_text    = analyze_image_with_groq(image)
             if ocr_text.strip():
                 image_texts.append(ocr_text.strip())
-                
         except Exception as e:
             print(f"Skipping pdf image error: {e}")
-            continue
-            
     return " ".join(image_texts)
+
 
 def load_pdf(file_path):
     filename = os.path.basename(file_path)
@@ -149,10 +147,9 @@ def load_pdf(file_path):
     skipped  = 0
 
     for page_num in range(len(doc)):
-        page = doc[page_num] 
+        page     = doc[page_num]
         raw_text = page.get_text()
-        # image_text = extract_images_text_from_pdf_page(doc, page)
-        full_text = raw_text + " " 
+        full_text = raw_text + " "
         if is_garbage_text(full_text):
             skipped += 1
             continue
@@ -160,14 +157,14 @@ def load_pdf(file_path):
         if len(cleaned) < 50:
             skipped += 1
             continue
-
         pages.append({
-            "text"    : cleaned,
+            "text":     cleaned,
             "page_num": page_num + 1,
-            "source"  : filename
+            "source":   filename
         })
     doc.close()
     return pages
+
 
 def load_image(file_path):
     filename = os.path.basename(file_path)
@@ -178,10 +175,11 @@ def load_image(file_path):
         return []
     return [{"text": cleaned, "page_num": 1, "source": filename}]
 
+
 def load_docx(file_path):
-    filename = os.path.basename(file_path)
-    doc      = Document(file_path)
-    pages    = []
+    filename   = os.path.basename(file_path)
+    doc        = Document(file_path)
+    pages      = []
     para_batch = []
     page_num   = 1
 
@@ -190,33 +188,22 @@ def load_docx(file_path):
         if text:
             para_batch.append(text)
 
-        # every 20 paragraphs treat as one page
         if len(para_batch) >= 20:
             full_text = " ".join(para_batch)
             cleaned   = clean_text(full_text)
-
             if not is_garbage_text(full_text) and len(cleaned) >= 50:
-                pages.append({
-                    "text"    : cleaned,
-                    "page_num": page_num,
-                    "source"  : filename
-                })
+                pages.append({"text": cleaned, "page_num": page_num, "source": filename})
                 page_num += 1
-
             para_batch = []
 
-    #remaining paragraphs
     if para_batch:
         full_text = " ".join(para_batch)
         cleaned   = clean_text(full_text)
-
         if not is_garbage_text(full_text) and len(cleaned) >= 50:
-            pages.append({
-                "text"    : cleaned,
-                "page_num": page_num,
-                "source"  : filename
-            })
+            pages.append({"text": cleaned, "page_num": page_num, "source": filename})
+
     return pages
+
 
 def load_xlsx(file_path):
     filename = os.path.basename(file_path)
@@ -226,7 +213,6 @@ def load_xlsx(file_path):
     for sheet_num, sheet_name in enumerate(wb.sheetnames):
         ws         = wb[sheet_name]
         sheet_rows = []
-
         for row in ws.iter_rows(values_only=True):
             row_text = " | ".join(
                 str(cell) for cell in row
@@ -238,13 +224,13 @@ def load_xlsx(file_path):
         full_text = " ".join(sheet_rows)
         if len(full_text.strip()) < 10:
             continue
-        cleaned = clean_text(full_text)
         pages.append({
-            "text"    : cleaned,
+            "text":     clean_text(full_text),
             "page_num": sheet_num + 1,
-            "source"  : filename
+            "source":   filename
         })
     return pages
+
 
 def load_file(file_path):
     if not os.path.exists(file_path):
@@ -259,26 +245,40 @@ def load_file(file_path):
         return load_ppt(file_path)
     elif ext in [".xlsx", ".xls"]:
         return load_xlsx(file_path)
-    elif ext in [".docx", ".doc"]: 
+    elif ext in [".docx", ".doc"]:
         return load_docx(file_path)
     else:
         print(f"Unsupported file type: {ext}")
         return []
 
-def main_pipeline(file_paths):
+
+def main_pipeline(file_paths, user_id: str = None):
+    """
+    user_id is now stored in each Qdrant point's payload so queries can be
+    filtered by owner (preventing cross-user data leakage).
+    """
     client = setup_qdrant()
     create_collection(client)
+
     if isinstance(file_paths, str):
         file_paths = [file_paths]
 
-    all_pages  = []
-
+    all_pages: list[dict] = []
     for file_path in file_paths:
         print(f"processing: {file_path}")
         pages = load_file(file_path)
+        # Stamp user_id onto every page so it flows into chunk payload
+        if user_id:
+            for page in pages:
+                page["user_id"] = user_id
         all_pages.extend(pages)
 
     chunks  = make_chunks(all_pages)
+    # Carry user_id through to chunks
+    if user_id:
+        for chunk in chunks:
+            chunk["user_id"] = user_id
+
     model   = load_model()
     vectors = embed_chunks(chunks, model)
     insert_to_qdrant(chunks, vectors, client)
@@ -286,8 +286,7 @@ def main_pipeline(file_paths):
 
     return client, model
 
+
 if __name__ == "__main__":
-    files = [
-        #add files to process
-    ]
+    files = []
     client, model = main_pipeline(files)

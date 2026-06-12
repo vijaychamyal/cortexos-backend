@@ -2,12 +2,15 @@ import re
 import os
 
 from qdrant_client import QdrantClient
-from .config import collection_name
-from .config import QdrantConfig
+from .config import collection_name, QdrantConfig
 from fastembed import TextEmbedding
 
-# symbol removal and text cleaning
-def clean_text(text):
+# Force low-level C++ libraries to only use 1 thread (set before model loads)
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
+
+def clean_text(text: str) -> str:
     text = re.sub(r'\x00', ' ', text)
     text = re.sub(r'[\u2500-\u27FF]', ' ', text)
     text = re.sub(r'[\u2000-\u206F]', ' ', text)
@@ -16,23 +19,21 @@ def clean_text(text):
     text = re.sub(r' +', ' ', text)
     return text.strip()
 
-# garbage detection after cleaning
-def is_garbage_text(text):
+
+def is_garbage_text(text: str) -> bool:
     cleaned = re.sub(r'[^\x20-\x7E]', ' ', text)
     cleaned = re.sub(r' +', ' ', cleaned).strip()
     words   = cleaned.split()
 
-    if len(words) < 10:                 
+    if len(words) < 10:
         return True
-
     avg_len = sum(len(w) for w in words) / len(words)
     if avg_len < 2.5:
         return True
-
     return False
 
 
-def setup_qdrant():
+def setup_qdrant() -> QdrantClient:
     try:
         qdrant_config = QdrantConfig()
         client = QdrantClient(
@@ -46,28 +47,21 @@ def setup_qdrant():
         raise e
 
 
-# 1. Force low-level C++ libraries to only use 1 thread (must be set before model loads)
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
+def load_model() -> TextEmbedding:
+    return TextEmbedding("sentence-transformers/all-MiniLM-L6-v2")
 
 
-def load_model():
-    model = TextEmbedding("sentence-transformers/all-MiniLM-L6-v2")
-    return model
-
-# verify insertion
-def verify_insert(client):
+def verify_insert(client) -> None:
     info   = client.get_collection(collection_name)
     sample = client.retrieve(
         collection_name=collection_name,
-        ids            =[0],
-        with_payload   =True,
-        with_vectors   =False
+        ids=[0],
+        with_payload=True,
+        with_vectors=False
     )
-
-    print(f"verification")
+    print("verification")
     print(f"  Points stored : {info.points_count}")
-    print(f"  Vector size : {info.config.params.vectors.size}")
-    print(f"  chunk_text : {sample[0].payload['chunk_text'][:200]}")
-    print(f"  page_num : {sample[0].payload['page_num']}")
-    print(f"  source : {sample[0].payload['source']}")
+    print(f"  Vector size   : {info.config.params.vectors.size}")
+    print(f"  chunk_text    : {sample[0].payload['chunk_text'][:200]}")
+    print(f"  page_num      : {sample[0].payload['page_num']}")
+    print(f"  source        : {sample[0].payload['source']}")

@@ -13,11 +13,11 @@ class EmbedConfig(BaseModel):
     chunk_overlap : int = Field(default=200,  gt=0)
 
 class RetrievalConfig(BaseModel):
-    top_k         : int = Field(default=10, gt=0)
-    top_n         : int = Field(default=3,  gt=0)
-    gemini_model  : str = "models/gemini-2.5-flash"
-    rerank_model  : str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    top_k        : int = Field(default=10, gt=0)
+    top_n        : int = Field(default=3,  gt=0)
+    gemini_model : str = "models/gemini-2.5-flash"
+    rerank_model : str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
-config = EmbedConfig()
-qdrant_config = QdrantConfig()
+config           = EmbedConfig()
+qdrant_config    = QdrantConfig()
 retrieval_config = RetrievalConfig()
