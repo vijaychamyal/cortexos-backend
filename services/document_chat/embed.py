@@ -302,10 +302,16 @@ def load_file(file_path):
         return []
 
 
-def main_pipeline(file_path: str, user_id: str, qdrant_client=None, embedding_model=None):
+def main_pipeline(file_path: str, user_id: str, qdrant_client=None, embedding_model=None,
+                  original_filename: str = None):
     """
     user_id is stored in each Qdrant point's payload so queries can be
     filtered by owner (preventing cross-user data leakage).
+
+    original_filename: the real uploaded name. We store THIS as `source`
+    so chat (which filters by the original filename) actually matches.
+    Without it, the temp file name (e.g. "temp_foo.pdf") leaks into `source`
+    and every filtered search returns nothing.
     """
     from .processor import setup_qdrant as _setup, load_model as _load
 
@@ -321,8 +327,11 @@ def main_pipeline(file_path: str, user_id: str, qdrant_client=None, embedding_mo
     for fp in file_paths:
         print(f"processing: {fp}")
         pages = load_file(fp)
-        if user_id:
-            for page in pages:
+        for page in pages:
+            # Force the real upload name as the source (fixes chat filter mismatch)
+            if original_filename:
+                page["source"] = original_filename
+            if user_id:
                 page["user_id"] = user_id
         all_pages.extend(pages)
         gc.collect()

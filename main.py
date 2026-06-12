@@ -6,6 +6,7 @@ from typing import Optional
 import traceback
 import gc
 import os
+import uuid
 import db
 
 from services.document_chat.processor import (
@@ -19,6 +20,7 @@ from services.document_chat.processor import (
 )
 
 from services.document_chat.embed import main_pipeline
+from services.stock.analysis import stock_chat, predict_prices
 
 ai_models = {}
 
@@ -61,6 +63,15 @@ class ChatRequest(BaseModel):
     user_id:  str
 
 
+class StockChatRequest(BaseModel):
+    question: str
+
+
+class StockPredictRequest(BaseModel):
+    ticker: str
+    horizon: Optional[int] = 7
+
+
 @app.get("/")
 def health_check():
     return {"status": "ok", "service": "CortexOS Backend"}
@@ -76,7 +87,11 @@ async def upload_file(
     file:    UploadFile = File(...),
     user_id: str        = Form(...)
 ):
-    temp_file_path = f"temp_{file.filename}"
+    # Use a unique temp name (preserving extension) so concurrent uploads of
+    # the same filename don't clobber each other. The real name is tracked
+    # separately and stored as the Qdrant `source`.
+    _ext = os.path.splitext(file.filename or "")[1]
+    temp_file_path = f"temp_{uuid.uuid4().hex}{_ext}"
     try:
         # 1. Stream the upload straight to disk in chunks so we never hold the
         #    whole file in RAM. Track size as we go and enforce a hard cap.
@@ -104,9 +119,16 @@ async def upload_file(
         # 4. Register in Postgres
         db.register_user_document(user_id, file.filename, storage_path, size_mb)
 
-        # 5. Embed and index into Qdrant (streams internally)
+        # 5. Embed and index into Qdrant (streams internally).
+        #    Pass the ORIGINAL filename so the stored `source` matches what
+        #    the chat endpoint filters by (otherwise search returns nothing).
         gc.collect()
-        main_pipeline(temp_file_path, user_id=user_id, qdrant_client=ai_models["qdrant_client"])
+        main_pipeline(
+            temp_file_path,
+            user_id=user_id,
+            qdrant_client=ai_models["qdrant_client"],
+            original_filename=file.filename,
+        )
         gc.collect()
 
         return {
@@ -143,6 +165,39 @@ async def chat_endpoint(request: ChatRequest):
             user_id  = request.user_id
         )
         return {"answer": answer}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Capital Pulse: Stock Intelligence ─────────────────────────────────────────
+
+@app.post("/stock/chat")
+async def stock_chat_endpoint(request: StockChatRequest):
+    """Analytical stock chatbot: explains market moves using live data + news."""
+    if not request.question:
+        raise HTTPException(status_code=400, detail="Question is required")
+    try:
+        result = stock_chat(request.question, ai_models["gemini_llm"])
+        return result
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/stock/predict")
+async def stock_predict_endpoint(request: StockPredictRequest):
+    """Lightweight 7-day price forecast with RMSE/MAE/MAPE backtest metrics."""
+    if not request.ticker:
+        raise HTTPException(status_code=400, detail="Ticker is required")
+    try:
+        horizon = max(1, min(int(request.horizon or 7), 30))
+        result = predict_prices(request.ticker.strip().upper(), horizon=horizon)
+        if "error" in result:
+            raise HTTPException(status_code=400, detail=result["error"])
+        return result
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))

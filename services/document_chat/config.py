@@ -17,9 +17,12 @@ class EmbedConfig(BaseModel):
     insert_batch  : int = Field(default=64,   gt=0)
 
 class RetrievalConfig(BaseModel):
-    # Fewer candidates to rerank = less CPU latency on Render's single core.
-    top_k        : int = Field(default=6, gt=0)
-    top_n        : int = Field(default=3,  gt=0)
+    # top_k = how many candidates Qdrant returns for the reranker to re-score.
+    # A wider pool gives the cross-encoder more to work with = better ranking.
+    top_k        : int = Field(default=12, gt=0)
+    # top_n = how many of the best chunks are actually sent to the LLM.
+    # More context = better, more grounded answers (at a little more latency).
+    top_n        : int = Field(default=5,  gt=0)
     gemini_model : str = "models/gemini-2.5-flash"
     rerank_model : str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 

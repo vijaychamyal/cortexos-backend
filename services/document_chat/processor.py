@@ -13,9 +13,10 @@ top_n = retrieval_config.top_n
 
 load_dotenv()
 
-# Reranking adds CPU latency and ~100-150 MB RAM (the cross-encoder model).
-# Set USE_RERANKER=false on Render if you ever hit memory pressure — search
-# quality drops slightly but it's faster and lighter.
+# Reranking strongly improves answer quality: Qdrant's raw vector order is
+# decent but the cross-encoder re-scores candidates much more accurately.
+# It stays ON by default. Only set USE_RERANKER=false as a last resort if you
+# hit hard memory limits on Render (frees ~100-150 MB).
 USE_RERANKER = os.getenv("USE_RERANKER", "true").lower() not in ("false", "0", "no")
 
 # ── Qdrant ────────────────────────────────────────────────────────────────────
@@ -79,16 +80,22 @@ def load_llm():
 
 
 RAG_PROMPT_TEMPLATE = """\
-You are a helpful assistant that answers questions strictly based on the provided context.
+You are CortexOS, an expert document analyst. Answer the user's question using \
+the document excerpts provided below.
 
-Context from the document:
+Document excerpts (each tagged with its page number):
 {context}
 
-Instructions:
-- Answer only based on the context above
-- If the answer is not in the context, say "I could not find this information in the document"
-- Mention the page number where you found the answer
-- Be concise and precise
+Guidelines:
+- Base your answer primarily on the excerpts above.
+- For summary / "key points" / "main idea" style requests, synthesize across \
+ALL the excerpts into a clear, well-structured answer (use short bullets or \
+sections where helpful).
+- Cite the page number(s) you used, like (p. 3), where relevant.
+- If the excerpts genuinely don't contain anything related to the question, \
+say so briefly and mention what the document does appear to cover.
+- Be accurate, helpful, and well-organized. Do not invent facts that aren't \
+supported by the excerpts.
 
 Question: {question}
 
@@ -116,28 +123,46 @@ def create_rag_chain(llm_client, prompt_template: str):
                 context=inputs["context"],
                 question=inputs["question"]
             )
-            # thinking_budget=0 disables Gemini 2.5's "thinking" phase, which
-            # otherwise adds several seconds of latency per answer. Capping
-            # max_output_tokens also keeps responses snappy.
+            # We keep a SMALL thinking budget instead of disabling it. Disabling
+            # thinking entirely noticeably hurt answer quality; a small budget
+            # is a good balance of quality vs. latency. Tune via GEMINI_THINKING.
+            thinking_budget = int(os.getenv("GEMINI_THINKING", "512"))
+            config = genai_types.GenerateContentConfig(
+                temperature=0.3,
+                max_output_tokens=2048,
+            )
+            # thinking_budget=0 means "off"; -1 means "dynamic/unbounded".
+            if thinking_budget >= 0:
+                config.thinking_config = genai_types.ThinkingConfig(
+                    thinking_budget=thinking_budget
+                )
             response = self._client.models.generate_content(
                 model=retrieval_config.gemini_model,
                 contents=prompt_text,
-                config=genai_types.GenerateContentConfig(
-                    thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
-                    max_output_tokens=1024,
-                    temperature=0.2,
-                ),
+                config=config,
             )
-            return response.text
+            # response.text can be None if the model returned no parts (e.g.
+            # safety block or an empty thinking-only turn). Fall back gracefully
+            # instead of letting a None crash the endpoint.
+            text = getattr(response, "text", None)
+            if text:
+                return text
+            try:
+                parts = response.candidates[0].content.parts
+                joined = "".join(getattr(p, "text", "") or "" for p in parts).strip()
+                if joined:
+                    return joined
+            except Exception:
+                pass
+            return ("I wasn't able to generate an answer for that. "
+                    "Please try rephrasing your question.")
 
     return SimpleChain(llm_client, prompt_template)
 
 
 # ── Qdrant search ─────────────────────────────────────────────────────────────
 
-def search_qdrant(query, model, client, filename=None, user_id=None):
-    query_vector = list(model.embed([query]))[0].tolist()
-
+def _run_search(query_vector, client, filename=None, user_id=None):
     must_conditions = []
 
     if filename:
@@ -158,7 +183,7 @@ def search_qdrant(query, model, client, filename=None, user_id=None):
 
     query_filter = models.Filter(must=must_conditions) if must_conditions else None
 
-    results = client.query_points(
+    return client.query_points(
         collection_name=collection_name,
         query=query_vector,
         query_filter=query_filter,
@@ -166,11 +191,25 @@ def search_qdrant(query, model, client, filename=None, user_id=None):
         with_payload=True
     ).points
 
+
+def search_qdrant(query, model, client, filename=None, user_id=None):
+    query_vector = list(model.embed([query]))[0].tolist()
+
+    # Primary search: this user's chunks from the selected file.
+    results = _run_search(query_vector, client, filename=filename, user_id=user_id)
+
+    # Safety net: if a specific file was requested but nothing matched (e.g.
+    # legacy data indexed before the filename fix), fall back to searching all
+    # of this user's documents so chat still returns something useful.
+    if not results and filename and user_id:
+        print("[search] no match for filename; falling back to user-wide search")
+        results = _run_search(query_vector, client, filename=None, user_id=user_id)
+
     return [
         {
             "text": r.payload["chunk_text"],
-            "page_num": r.payload["page_num"],
-            "source": r.payload["source"],
+            "page_num": r.payload.get("page_num", "?"),
+            "source": r.payload.get("source", "?"),
             "score": round(r.score, 3)
         }
         for r in results
