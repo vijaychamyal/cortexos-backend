@@ -1,5 +1,6 @@
 import groq
 import base64
+import gc
 import os
 import fitz
 import io
@@ -11,26 +12,36 @@ from pptx import Presentation
 from docx import Document
 from dotenv import load_dotenv
 
-from .processing import make_chunks, embed_chunks
-from .database import create_collection, insert_to_qdrant
+from .processing import make_chunks, embed_texts_iter
+from .database import create_collection, insert_stream_to_qdrant
 from .utilities import clean_text, is_garbage_text, verify_insert
 from .processor import setup_qdrant, load_model  # use cloud Qdrant + shared model
 load_dotenv()
+
+# Cap the combined OCR image size aggressively. A 30 MP RGB image is ~90 MB
+# raw and the LANCZOS resize allocates a second copy — that alone can blow
+# Render's 512 MB budget. 4 MP is plenty for OCR/vision text extraction.
+MAX_OCR_PIXELS = int(os.getenv("MAX_OCR_PIXELS", str(4_000_000)))
 
 groq_client = groq.Groq(api_key=os.getenv("groq_api_key"))
 
 
 def analyze_image_with_groq(image: Image.Image) -> str:
     buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
+    # JPEG is far smaller than PNG in memory/payload and fine for OCR.
+    rgb = image.convert("RGB") if image.mode != "RGB" else image
+    rgb.save(buffer, format="JPEG", quality=80)
+    if rgb is not image:
+        rgb.close()
     img_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    buffer.close()
     try:
         response = groq_client.chat.completions.create(
             model="meta-llama/llama-4-scout-17b-16e-instruct",
             messages=[{
                 "role": "user",
                 "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_base64}"}},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}},
                     {"type": "text", "text": "Extract all text from this image. If no text, describe what you see in two or more sentences"}
                 ]
             }]
@@ -39,18 +50,26 @@ def analyze_image_with_groq(image: Image.Image) -> str:
     except Exception as e:
         print(f"groq error: {e}")
         return ""
+    finally:
+        del img_base64
+        gc.collect()
 
 
-def concatenate_images_vertically(images: list[Image.Image], max_pixels=30000000) -> Image.Image:
+def concatenate_images_vertically(images: list[Image.Image], max_pixels=MAX_OCR_PIXELS) -> Image.Image:
     if not images:
         return None
 
-    max_width = max(img.width for img in images)
+    # Cap the working width so individual huge images don't explode memory.
+    MAX_WIDTH = 1600
+    max_width = min(max(img.width for img in images), MAX_WIDTH)
+
     resized = []
     for img in images:
         if img.width != max_width:
             ratio = max_width / img.width
-            img = img.resize((max_width, int(img.height * ratio)), Image.LANCZOS)
+            new = img.resize((max_width, max(1, int(img.height * ratio))), Image.LANCZOS)
+            img.close()  # free the original copy ASAP
+            img = new
         resized.append(img)
 
     total_height = sum(img.height for img in resized)
@@ -59,11 +78,19 @@ def concatenate_images_vertically(images: list[Image.Image], max_pixels=30000000
     for img in resized:
         combined.paste(img, (0, y))
         y += img.height
+        img.close()  # free each source after pasting
+    resized.clear()
 
     if combined.width * combined.height > max_pixels:
         scale = (max_pixels / (combined.width * combined.height)) ** 0.5
-        combined = combined.resize((int(combined.width * scale), int(combined.height * scale)), Image.LANCZOS)
+        shrunk = combined.resize(
+            (max(1, int(combined.width * scale)), max(1, int(combined.height * scale))),
+            Image.LANCZOS,
+        )
+        combined.close()
+        combined = shrunk
 
+    gc.collect()
     return combined
 
 
@@ -107,7 +134,9 @@ def load_ppt(file_path):
         image_text = ""
         if batch_images:
             combined = concatenate_images_vertically(batch_images)
-            image_text = analyze_image_with_groq(combined)
+            if combined is not None:
+                image_text = analyze_image_with_groq(combined)
+                combined.close()
 
         for s in batch:
             full_text = " ".join(s['text']) + " " + image_text
@@ -119,6 +148,16 @@ def load_ppt(file_path):
                     "page_num": s['num'] + 1,
                     "source":   filename
                 })
+
+        # Free this batch's images before moving on.
+        for s in batch:
+            for img in s['images']:
+                try:
+                    img.close()
+                except Exception:
+                    pass
+            s['images'] = []
+        gc.collect()
 
     if temp_converted and os.path.exists(file_path):
         os.remove(file_path)
@@ -171,9 +210,17 @@ def load_pdf(file_path):
 
 def load_image(file_path):
     filename = os.path.basename(file_path)
-    image    = Image.open(file_path)
-    text     = analyze_image_with_groq(image)
-    cleaned  = clean_text(text)
+    with Image.open(file_path) as image:
+        # Downscale very large images before OCR to cap memory.
+        if image.width * image.height > MAX_OCR_PIXELS:
+            scale = (MAX_OCR_PIXELS / (image.width * image.height)) ** 0.5
+            image = image.resize(
+                (max(1, int(image.width * scale)), max(1, int(image.height * scale))),
+                Image.LANCZOS,
+            )
+        text = analyze_image_with_groq(image)
+    gc.collect()
+    cleaned = clean_text(text)
     if len(cleaned) < 5:
         return []
     return [{"text": cleaned, "page_num": 1, "source": filename}]
@@ -278,16 +325,27 @@ def main_pipeline(file_path: str, user_id: str, qdrant_client=None, embedding_mo
             for page in pages:
                 page["user_id"] = user_id
         all_pages.extend(pages)
+        gc.collect()
 
     chunks = make_chunks(all_pages)
     if user_id:
         for chunk in chunks:
             chunk["user_id"] = user_id
 
-    vectors = embed_chunks(chunks, model)
-    insert_to_qdrant(chunks, vectors, client)
+    # Free the page text now that chunks are built.
+    all_pages.clear()
+    gc.collect()
 
-    print(f"[Pipeline] Done. Inserted {len(chunks)} chunks for user {user_id}.")
+    # Stream embeddings -> Qdrant in small batches so we never hold all
+    # vectors in RAM at once (keeps peak memory under Render's 512 MB cap).
+    texts = [c["chunk_text"] for c in chunks]
+    vector_iter = embed_texts_iter(texts, model)
+    inserted = insert_stream_to_qdrant(chunks, vector_iter, client)
+
+    del texts, vector_iter, chunks
+    gc.collect()
+
+    print(f"[Pipeline] Done. Inserted {inserted} chunks for user {user_id}.")
     return client, model
 
 

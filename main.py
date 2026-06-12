@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from typing import Optional
 import traceback
+import gc
 import os
 import db
 
@@ -58,6 +59,11 @@ def health_check():
     return {"status": "ok", "service": "CortexOS Backend"}
 
 
+# Reject very large files up front — they can't be processed within the
+# 512 MB free-tier budget anyway. Tune via MAX_UPLOAD_MB env var.
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "25"))
+
+
 @app.post("/upload")
 async def upload_file(
     file:    UploadFile = File(...),
@@ -65,29 +71,44 @@ async def upload_file(
 ):
     temp_file_path = f"temp_{file.filename}"
     try:
-        contents = await file.read()
+        # 1. Stream the upload straight to disk in chunks so we never hold the
+        #    whole file in RAM. Track size as we go and enforce a hard cap.
+        size_bytes = 0
+        max_bytes = MAX_UPLOAD_MB * 1024 * 1024
+        with open(temp_file_path, "wb") as f:
+            while True:
+                chunk = await file.read(1024 * 1024)  # 1 MB at a time
+                if not chunk:
+                    break
+                size_bytes += len(chunk)
+                if size_bytes > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File too large. Max allowed is {MAX_UPLOAD_MB} MB."
+                    )
+                f.write(chunk)
 
-        # 1. Upload to Supabase cloud storage
-        storage_path = db.upload_file_to_cloud(user_id, contents, file.filename)
+        # 2. Upload to Supabase from the temp file path (no extra in-RAM copy).
+        storage_path = db.upload_file_from_path(user_id, temp_file_path, file.filename)
 
-        # 2. File size metadata
-        size_mb = f"{round(len(contents) / (1024 * 1024), 1)} MB · Just now"
+        # 3. File size metadata
+        size_mb = f"{round(size_bytes / (1024 * 1024), 1)} MB · Just now"
 
-        # 3. Register in Postgres
+        # 4. Register in Postgres
         db.register_user_document(user_id, file.filename, storage_path, size_mb)
 
-        # 4. Write temp file for Qdrant indexing
-        with open(temp_file_path, "wb") as f:
-            f.write(contents)
-
-        # 5. Embed and index into Qdrant
-        main_pipeline(temp_file_path, user_id=user_id, qdrant_client=ai_models["qdrant_client"])    
+        # 5. Embed and index into Qdrant (streams internally)
+        gc.collect()
+        main_pipeline(temp_file_path, user_id=user_id, qdrant_client=ai_models["qdrant_client"])
+        gc.collect()
 
         return {
             "message":  f"File '{file.filename}' processed and indexed successfully!",
             "filename": file.filename
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         # Print full traceback to Render logs so you can see the real error
         traceback.print_exc()
@@ -97,6 +118,7 @@ async def upload_file(
         # Always clean up the temp file
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
+        gc.collect()
 
 
 @app.post("/chat")

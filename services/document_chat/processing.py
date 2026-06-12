@@ -89,3 +89,12 @@ def embed_chunks(chunks: list[dict], model) -> list:
     texts = [chunk["chunk_text"] for chunk in chunks]
     print(f"Embedding {len(texts)} chunks")
     return list(model.embed(texts, batch_size=batch_size))
+
+
+def embed_texts_iter(texts, model):
+    """
+    Memory-friendly generator: yields embedding vectors one at a time.
+    fastembed's .embed() is itself a lazy generator, so iterating it here
+    means we never hold all vectors in RAM simultaneously.
+    """
+    yield from model.embed(texts, batch_size=batch_size)

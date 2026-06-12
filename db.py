@@ -99,3 +99,26 @@ def upload_file_to_cloud(user_id: str, file_bytes: bytes, filename: str) -> str:
     )
 
     return cloud_path
+
+
+def upload_file_from_path(user_id: str, local_path: str, filename: str) -> str:
+    """
+    Memory-friendly upload: hands Supabase the file path so the client reads
+    from disk instead of us holding the whole file in RAM as bytes.
+    """
+    cloud_path = f"{user_id}/{filename}"
+
+    content_type, _ = mimetypes.guess_type(filename)
+    if not content_type:
+        content_type = "application/octet-stream"
+
+    _supabase.storage.from_("documents").upload(
+        path=cloud_path,
+        file=local_path,
+        file_options={
+            "content-type": content_type,
+            "upsert": "true",
+        }
+    )
+
+    return cloud_path

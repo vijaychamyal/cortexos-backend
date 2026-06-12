@@ -8,9 +8,13 @@ class QdrantConfig(BaseModel):
 
 class EmbedConfig(BaseModel):
     vector_size   : int = Field(default=384,  gt=0)
-    batch_size    : int = Field(default=32,   gt=0)
+    # Keep batches small so peak RAM stays well under Render's 512 MB cap.
+    batch_size    : int = Field(default=8,    gt=0)
     chunk_size    : int = Field(default=1000, gt=0)
     chunk_overlap : int = Field(default=200,  gt=0)
+    # How many chunks to embed + insert into Qdrant at a time before freeing
+    # the vectors. This bounds peak memory regardless of document size.
+    insert_batch  : int = Field(default=64,   gt=0)
 
 class RetrievalConfig(BaseModel):
     top_k        : int = Field(default=10, gt=0)
