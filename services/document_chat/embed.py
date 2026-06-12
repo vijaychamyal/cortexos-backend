@@ -152,6 +152,7 @@ def load_pdf(file_path):
         full_text = raw_text + " "
         if is_garbage_text(full_text):
             skipped += 1
+            print(f"[PDF] Skipping page {page_num+1} — garbage text detected")
             continue
         cleaned = clean_text(full_text)
         if len(cleaned) < 50:
@@ -162,7 +163,9 @@ def load_pdf(file_path):
             "page_num": page_num + 1,
             "source":   filename
         })
+    print(f"[PDF] {filename}: {len(pages)} pages loaded, {skipped} skipped")
     doc.close()
+    
     return pages
 
 
