@@ -33,22 +33,8 @@ def is_garbage_text(text: str) -> bool:
     return False
 
 
-def setup_qdrant() -> QdrantClient:
-    try:
-        qdrant_config = QdrantConfig()
-        client = QdrantClient(
-            host=qdrant_config.host,
-            port=qdrant_config.port
-        )
-        return client
-    except Exception as e:
-        print("Qdrant is not connected")
-        print("First run: docker run -p 6333:6333 qdrant/qdrant")
-        raise e
 
 
-def load_model() -> TextEmbedding:
-    return TextEmbedding("sentence-transformers/all-MiniLM-L6-v2")
 
 
 def verify_insert(client) -> None:
