@@ -36,18 +36,28 @@ def ensure_payload_indexes(client):
                 print(f"[warn] could not create index for '{field}': {e}")
 
 
-def create_collection(client):
-    existing = [c.name for c in client.get_collections().collections]
+def collection_exists(client):
+    try:
+        return collection_name in [c.name for c in client.get_collections().collections]
+    except Exception:
+        return False
 
-    if collection_name not in existing:
+
+def create_collection(client, size: int = None):
+    """Create the collection if missing. `size` overrides the configured
+    vector_size so the collection always matches the embedder's ACTUAL output
+    dimension (different Google embedding models => different dimensions)."""
+    size = size or vector_size
+
+    if not collection_exists(client):
         client.create_collection(
             collection_name=collection_name,
             vectors_config=VectorParams(
-                size=vector_size,
+                size=size,
                 distance=Distance.COSINE
             )
         )
-        print(f"Collection '{collection_name}' created.")
+        print(f"Collection '{collection_name}' created with dim={size}.")
 
     # Always ensure indexes exist (safe to call even if they already exist)
     ensure_payload_indexes(client)
@@ -109,12 +119,24 @@ def insert_stream_to_qdrant(chunks, vector_iter, client):
     """
     Streaming insert: pulls vectors one at a time from a generator and
     upserts them in small batches. Never holds all vectors in RAM at once.
+
+    The collection is created lazily from the FIRST vector's actual length, so
+    the stored dimension always matches whatever Google embedding model was
+    auto-detected (768, 1536, 3072, ...).
     """
     id_offset = _id_offset(client)
 
     points = []
     total = 0
+    created = collection_exists(client)
     for i, (chunk, vector) in enumerate(zip(chunks, vector_iter)):
+        vec = vector.tolist() if hasattr(vector, "tolist") else list(vector)
+
+        if not created:
+            create_collection(client, size=len(vec))
+            created = True
+            id_offset = _id_offset(client)
+
         payload = {
             "chunk_text": chunk["chunk_text"],
             "page_num":   chunk["page_num"],
@@ -126,7 +148,7 @@ def insert_stream_to_qdrant(chunks, vector_iter, client):
 
         points.append(PointStruct(
             id=id_offset + i,
-            vector=vector.tolist() if hasattr(vector, "tolist") else list(vector),
+            vector=vec,
             payload=payload
         ))
 

@@ -318,7 +318,8 @@ def main_pipeline(file_path: str, user_id: str, qdrant_client=None, embedding_mo
     client = qdrant_client if qdrant_client is not None else _setup()
     model  = embedding_model if embedding_model is not None else _load()
 
-    create_collection(client)
+    # NOTE: the collection is created lazily inside insert_stream_to_qdrant()
+    # using the embedder's actual vector dimension, so we don't create it here.
 
     # file_path is always a single string — wrap it for uniform processing
     file_paths = [file_path] if isinstance(file_path, str) else file_path
