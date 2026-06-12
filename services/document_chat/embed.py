@@ -254,37 +254,37 @@ def load_file(file_path):
 
 def main_pipeline(file_path: str, user_id: str, qdrant_client=None, embedding_model=None):
     """
-    user_id is now stored in each Qdrant point's payload so queries can be
+    user_id is stored in each Qdrant point's payload so queries can be
     filtered by owner (preventing cross-user data leakage).
     """
-    from .processor import setup_qdrant as _setup,load_model as _load
+    from .processor import setup_qdrant as _setup, load_model as _load
+
     client = qdrant_client if qdrant_client is not None else _setup()
+    model  = embedding_model if embedding_model is not None else _load()
+
     create_collection(client)
 
-    if isinstance(file_paths, str):
-        file_paths = [file_paths]
+    # file_path is always a single string — wrap it for uniform processing
+    file_paths = [file_path] if isinstance(file_path, str) else file_path
 
     all_pages: list[dict] = []
-    for file_path in file_paths:
-        print(f"processing: {file_path}")
-        pages = load_file(file_path)
-        # Stamp user_id onto every page so it flows into chunk payload
+    for fp in file_paths:
+        print(f"processing: {fp}")
+        pages = load_file(fp)
         if user_id:
             for page in pages:
                 page["user_id"] = user_id
         all_pages.extend(pages)
 
-    chunks  = make_chunks(all_pages)
-    # Carry user_id through to chunks
+    chunks = make_chunks(all_pages)
     if user_id:
         for chunk in chunks:
             chunk["user_id"] = user_id
 
-    model = embedding_model if embedding_model is not None else _load()
     vectors = embed_chunks(chunks, model)
     insert_to_qdrant(chunks, vectors, client)
-    verify_insert(client)
 
+    print(f"[Pipeline] Done. Inserted {len(chunks)} chunks for user {user_id}.")
     return client, model
 
 
