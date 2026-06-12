@@ -1,13 +1,17 @@
 from pydantic import BaseModel, Field
 
-collection_name = "check_1_ppt"
+# New collection name because we switched from 384-dim MiniLM (fastembed) to
+# 768-dim Google text-embedding-004. A collection's vector size is fixed at
+# creation, so we must use a fresh collection rather than the old 384-dim one.
+collection_name = "cortex_docs_v2"
 
 class QdrantConfig(BaseModel):
     host: str = "localhost"
     port: int = 6333
 
 class EmbedConfig(BaseModel):
-    vector_size   : int = Field(default=384,  gt=0)
+    # 768 = Google text-embedding-004 native dimension.
+    vector_size   : int = Field(default=768,  gt=0)
     # Keep batches small so peak RAM stays well under Render's 512 MB cap.
     batch_size    : int = Field(default=8,    gt=0)
     chunk_size    : int = Field(default=1000, gt=0)

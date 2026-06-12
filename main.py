@@ -1,3 +1,22 @@
+import os
+
+# ── Memory tuning ─────────────────────────────────────────────────────────────
+# Embeddings now run on Google's hosted API (no local onnxruntime/fastembed
+# model), so baseline memory is tiny. These settings keep it even lower.
+#
+# glibc spawns one memory "arena" per thread and rarely returns freed memory to
+# the OS; capping arenas + single-threaded math keeps RAM flat.
+# NOTE: MALLOC_ARENA_MAX is read by glibc at PROCESS START, so for full effect
+# also set it as a real env var in the Render dashboard (Environment tab):
+#     MALLOC_ARENA_MAX = 2
+# The runtime malloc_trim() in services/mem.py reclaims memory live.
+os.environ.setdefault("MALLOC_ARENA_MAX", "2")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -5,7 +24,6 @@ from contextlib import asynccontextmanager
 from typing import Optional
 import traceback
 import gc
-import os
 import uuid
 import db
 
@@ -21,6 +39,7 @@ from services.document_chat.processor import (
 
 from services.document_chat.embed import main_pipeline
 from services.stock.analysis import stock_chat, predict_prices
+from services.mem import release_memory, mem_usage_mb
 
 ai_models = {}
 
@@ -41,9 +60,11 @@ async def lifespan(app: FastAPI):
     ai_models["gemini_llm"]      = load_llm()
     rag_prompt                   = create_prompt()
     ai_models["rag_chain"]       = create_rag_chain(ai_models["gemini_llm"], rag_prompt)
-    print("[CortexOS] All systems fully loaded and online!\n")
+    release_memory()
+    print(f"[CortexOS] All systems online! Baseline memory: {mem_usage_mb():.0f} MB\n")
     yield
     ai_models.clear()
+    release_memory()
 
 
 app = FastAPI(title="CortexOS Backend", lifespan=lifespan)
@@ -122,14 +143,14 @@ async def upload_file(
         # 5. Embed and index into Qdrant (streams internally).
         #    Pass the ORIGINAL filename so the stored `source` matches what
         #    the chat endpoint filters by (otherwise search returns nothing).
-        gc.collect()
+        release_memory()
         main_pipeline(
             temp_file_path,
             user_id=user_id,
             qdrant_client=ai_models["qdrant_client"],
             original_filename=file.filename,
         )
-        gc.collect()
+        release_memory()
 
         return {
             "message":  f"File '{file.filename}' processed and indexed successfully!",
@@ -147,7 +168,9 @@ async def upload_file(
         # Always clean up the temp file
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
-        gc.collect()
+        # Return freed heap to the OS so RAM doesn't ratchet up over time.
+        release_memory()
+        print(f"[mem] after upload: {mem_usage_mb():.0f} MB")
 
 
 @app.post("/chat")
@@ -168,6 +191,8 @@ async def chat_endpoint(request: ChatRequest):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        release_memory()
 
 
 # ── Capital Pulse: Stock Intelligence ─────────────────────────────────────────

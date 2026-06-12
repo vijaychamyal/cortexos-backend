@@ -1,22 +1,21 @@
 import os
+import json
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
-from fastembed.rerank.cross_encoder import TextCrossEncoder
-from fastembed import TextEmbedding
 from google import genai
 from google.genai import types as genai_types
 from dotenv import load_dotenv
 from .config import retrieval_config, collection_name
+from .gembed import GeminiEmbedder
 
 top_k = retrieval_config.top_k
 top_n = retrieval_config.top_n
 
 load_dotenv()
 
-# Reranking strongly improves answer quality: Qdrant's raw vector order is
-# decent but the cross-encoder re-scores candidates much more accurately.
-# It stays ON by default. Only set USE_RERANKER=false as a last resort if you
-# hit hard memory limits on Render (frees ~100-150 MB).
+# Reranking improves answer quality. We now rerank with Gemini itself (an API
+# call, ZERO local memory) instead of a local cross-encoder model that ate
+# ~120 MB of RAM. Set USE_RERANKER=false to skip it (slightly faster).
 USE_RERANKER = os.getenv("USE_RERANKER", "true").lower() not in ("false", "0", "no")
 
 # ── Qdrant ────────────────────────────────────────────────────────────────────
@@ -38,37 +37,37 @@ def setup_qdrant():
 # ── Embedding model ───────────────────────────────────────────────────────────
 
 def load_model():
-    print("[AI Engine] Loading MiniLM via fastembed...")
-    # Single-thread to keep memory low on free tier
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
-    return TextEmbedding("sentence-transformers/all-MiniLM-L6-v2")
+    """Return an API-based embedder (no local ML weights -> tiny memory).
+
+    This replaces the fastembed MiniLM model that used ~190 MB of RAM and was
+    the main cause of OOM kills on Render's 512 MB tier.
+    """
+    print("[AI Engine] Using Google text-embedding API (no local model).")
+    return GeminiEmbedder(load_llm())
 
 
-# ── Reranker (lazy — loaded on first query, not at startup) ───────────────────
-
-_reranker_cache = None
+# ── Reranker ──────────────────────────────────────────────────────────────────
+# The old local cross-encoder (~120 MB) is gone. Reranking, when enabled, is
+# done by Gemini via an API call (see rerank_chunks) — zero local memory.
 
 def load_reranker():
-    """
-    Returns a sentinel string instead of actually loading the model at startup.
-    The real model is loaded the first time rerank_chunks() is called.
-    This saves ~100-150 MB of startup RAM on Render's free tier.
-    """
-    return "lazy"
-
-
-def _get_reranker():
-    global _reranker_cache
-    if _reranker_cache is None:
-        print("[AI Engine] Loading reranker (first query)...")
-        _reranker_cache = TextCrossEncoder("Xenova/ms-marco-MiniLM-L-6-v2")
-    return _reranker_cache
+    return "gemini" if USE_RERANKER else "off"
 
 
 # ── Gemini (direct google-genai, no LangChain) ────────────────────────────────
 
+_llm_singleton = None
+
+
 def load_llm():
+    global _llm_singleton
+    if _llm_singleton is not None:
+        return _llm_singleton
+    _llm_singleton = _build_llm()
+    return _llm_singleton
+
+
+def _build_llm():
     """
     Returns a configured google-genai Client.
     Replaces ChatGoogleGenerativeAI from langchain-google-genai.
@@ -234,7 +233,11 @@ def _run_search(query_vector, client, filename=None, user_id=None):
 
 
 def search_qdrant(query, model, client, filename=None, user_id=None):
-    query_vector = list(model.embed([query]))[0].tolist()
+    # Use the RETRIEVAL_QUERY task type for the question side (better matching).
+    try:
+        query_vector = list(model.embed([query], task_type="RETRIEVAL_QUERY"))[0].tolist()
+    except TypeError:
+        query_vector = list(model.embed([query]))[0].tolist()
 
     # Primary search: this user's chunks from the selected file.
     results = _run_search(query_vector, client, filename=filename, user_id=user_id)
@@ -260,32 +263,68 @@ def search_qdrant(query, model, client, filename=None, user_id=None):
 # ── Reranking ─────────────────────────────────────────────────────────────────
 
 def rerank_chunks(query, chunks, reranker):
-    """reranker may be the 'lazy' sentinel string or None — both handled."""
+    """Rerank candidate chunks by relevance to the query.
+
+    Uses Gemini (an API call, zero local memory) to score each chunk, instead
+    of the old local cross-encoder that consumed ~120 MB of RAM. Falls back to
+    the vector-similarity order if reranking is off or the API call fails.
+    """
     if not chunks:
         return []
 
-    # If reranking is disabled, just trust Qdrant's vector similarity order.
     if not USE_RERANKER:
         return chunks[:top_n]
 
-    actual_reranker = _get_reranker()
-    documents = [chunk["text"] for chunk in chunks]
-    scores = list(actual_reranker.rerank(query, documents))
-
-    for i, chunk in enumerate(chunks):
-        chunk["rerank_score"] = round(float(scores[i]), 4)
-
-    reranked = sorted(chunks, key=lambda x: x["rerank_score"], reverse=True)
-
-    # Free the cross-encoder's transient working tensors right away.
-    del scores, documents
     try:
-        from services.mem import release_memory
-        release_memory()
-    except Exception:
-        pass
+        ranked = _gemini_rerank(query, chunks)
+        if ranked:
+            return ranked[:top_n]
+    except Exception as e:
+        print(f"[rerank] gemini rerank failed, using vector order: {e}")
 
-    return reranked[:top_n]
+    return chunks[:top_n]
+
+
+def _gemini_rerank(query, chunks):
+    """Ask Gemini to order the candidate chunks by relevance and return the
+    reordered list. Robust to malformed model output."""
+    client = load_llm()
+
+    listing = "\n".join(
+        f"[{i}] {c['text'][:500]}" for i, c in enumerate(chunks)
+    )
+    prompt = (
+        "You are a search reranker. Given a QUESTION and numbered PASSAGES, "
+        "return the passage indices ordered from MOST to LEAST relevant.\n"
+        "Respond with ONLY a JSON array of integers, e.g. [3,0,1].\n\n"
+        f"QUESTION: {query}\n\nPASSAGES:\n{listing}\n\nJSON:"
+    )
+
+    resp = _generate(client, prompt)
+    text = (getattr(resp, "text", None) or "").strip()
+
+    # Extract the JSON array of indices.
+    start, end = text.find("["), text.rfind("]")
+    order = []
+    if start != -1 and end != -1 and end > start:
+        try:
+            order = [int(x) for x in json.loads(text[start:end + 1])]
+        except Exception:
+            order = []
+
+    if not order:
+        return None
+
+    seen, result = set(), []
+    for idx in order:
+        if 0 <= idx < len(chunks) and idx not in seen:
+            seen.add(idx)
+            result.append(chunks[idx])
+    # Append any chunks the model omitted, preserving original order.
+    for i, c in enumerate(chunks):
+        if i not in seen:
+            result.append(c)
+    return result
 
 
 # ── Context formatting ────────────────────────────────────────────────────────

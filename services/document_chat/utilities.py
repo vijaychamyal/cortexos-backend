@@ -3,11 +3,6 @@ import os
 
 from qdrant_client import QdrantClient
 from .config import collection_name, QdrantConfig
-from fastembed import TextEmbedding
-
-# Force low-level C++ libraries to only use 1 thread (set before model loads)
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
 
 
 def clean_text(text: str) -> str:
