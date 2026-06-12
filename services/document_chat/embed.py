@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from .processing import make_chunks, embed_chunks
 from .database import create_collection, insert_to_qdrant
 from .utilities import clean_text, is_garbage_text, verify_insert
-from .processor import setup_qdrant, embedding_model  # use cloud Qdrant + shared model
+from .processor import setup_qdrant, load_model  # use cloud Qdrant + shared model
 load_dotenv()
 
 groq_client = groq.Groq(api_key=os.getenv("groq_api_key"))
