@@ -4,6 +4,7 @@ Handles explicit routing for both authenticated accounts and Guest access models
 """
 
 import os
+import mimetypes
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from supabase import create_client, Client
@@ -23,13 +24,7 @@ def _now_iso() -> str:
 # ──────────────────────────────────────────────────────────────
 
 def ensure_profile_exists(user_id: str, display_name: str = "Guest User", email: str = None) -> dict:
-    """
-    Ensures a corresponding tenant context row exists inside public.profiles.
-    """
-    # Changed: Instead of checking for a prefix, we assume they are a guest 
-    # if they are using the default "Guest User" display name.
     is_guest = (display_name == "Guest User")
-    
     payload = {
         "id": user_id,
         "display_name": display_name,
@@ -37,7 +32,6 @@ def ensure_profile_exists(user_id: str, display_name: str = "Guest User", email:
         "is_guest": is_guest,
         "updated_at": _now_iso()
     }
-    
     result = (
         _supabase
         .table("profiles")
@@ -51,13 +45,7 @@ def ensure_profile_exists(user_id: str, display_name: str = "Guest User", email:
 # ──────────────────────────────────────────────────────────────
 
 def register_user_document(user_id: str, filename: str, storage_path: str, file_size_meta: str) -> dict:
-    """
-    Saves a file reference to a specific user/guest context.
-    Prevents unauthorized global cross-contamination inside Vector lookups.
-    """
-    # Verify the profile container is active
     ensure_profile_exists(user_id)
-    
     payload = {
         "user_id": user_id,
         "filename": filename,
@@ -65,7 +53,6 @@ def register_user_document(user_id: str, filename: str, storage_path: str, file_
         "file_size_meta": file_size_meta,
         "created_at": _now_iso()
     }
-    
     result = (
         _supabase
         .table("user_documents")
@@ -75,9 +62,6 @@ def register_user_document(user_id: str, filename: str, storage_path: str, file_
     return result.data[0] if result.data else {}
 
 def get_tenant_documents(user_id: str) -> list[dict]:
-    """
-    Returns files strictly owned by the requesting session token.
-    """
     result = (
         _supabase
         .table("user_documents")
@@ -93,18 +77,20 @@ def get_tenant_documents(user_id: str) -> list[dict]:
 # ──────────────────────────────────────────────────────────────
 
 def upload_file_to_cloud(user_id: str, file_bytes: bytes, filename: str) -> str:
-    """
-    Streams local memory directly into the cloud Supabase storage container.
-    Returns the public path URL for processing.
-    """
-    # Create isolated path folder structure per user
     cloud_path = f"{user_id}/{filename}"
-    
-    # Upload binary object payload directly
+
+    # Detect correct content-type instead of hardcoding application/pdf
+    content_type, _ = mimetypes.guess_type(filename)
+    if not content_type:
+        content_type = "application/octet-stream"
+
     _supabase.storage.from_("documents").upload(
         path=cloud_path,
         file=file_bytes,
-        file_options={"content-type": "application/pdf"}
+        file_options={
+            "content-type": content_type,
+            "upsert": "true",   # overwrite if the same filename is re-uploaded
+        }
     )
-    
+
     return cloud_path
