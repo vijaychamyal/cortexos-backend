@@ -6,11 +6,15 @@ batch_size  = config.batch_size
 
 
 def create_collection(client):
+    """
+    Only creates the collection if it doesn't already exist.
+    Previously this deleted + recreated on every upload, wiping all documents.
+    """
     existing = [c.name for c in client.get_collections().collections]
 
     if collection_name in existing:
-        client.delete_collection(collection_name=collection_name)
-        print(f"Old collection '{collection_name}' deleted")
+        print(f"Collection '{collection_name}' already exists — skipping creation.")
+        return False
 
     client.create_collection(
         collection_name=collection_name,
@@ -19,13 +23,23 @@ def create_collection(client):
             distance=Distance.COSINE
         )
     )
-    print(f"Collection '{collection_name}' created")
+    print(f"Collection '{collection_name}' created.")
     return True
 
 
 def insert_to_qdrant(chunks, vectors, client):
-    points = []
+    """
+    Uses upsert with auto-incrementing IDs based on current collection size
+    so new uploads append rather than collide with existing points.
+    """
+    # Get current count so new point IDs don't overwrite existing ones
+    try:
+        info = client.get_collection(collection_name)
+        id_offset = info.points_count or 0
+    except Exception:
+        id_offset = 0
 
+    points = []
     for i, (chunk, vector) in enumerate(zip(chunks, vectors)):
         payload = {
             "chunk_text": chunk["chunk_text"],
@@ -33,12 +47,11 @@ def insert_to_qdrant(chunks, vectors, client):
             "source":     chunk["source"],
             "chunk_id":   chunk["chunk_id"],
         }
-        # Store user_id if present so queries can filter by owner
         if "user_id" in chunk:
             payload["user_id"] = chunk["user_id"]
 
         points.append(PointStruct(
-            id=i,
+            id=id_offset + i,
             vector=vector.tolist(),
             payload=payload
         ))
@@ -47,4 +60,4 @@ def insert_to_qdrant(chunks, vectors, client):
         collection_name=collection_name,
         points=points
     )
-    print(f"Inserted {len(points)} points")
+    print(f"Inserted {len(points)} points (total offset was {id_offset})")
